@@ -14,5 +14,6 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "aiofiles>=23.0.0",
     "langchain>=1.2.6",
+    "pydantic-settings>=2.14.0",
 ]
 

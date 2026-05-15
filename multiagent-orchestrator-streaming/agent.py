@@ -48,23 +48,32 @@ Orchestration events:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import operator
-import os
 from typing import Annotated, Literal
 
 import httpx
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    trim_messages,
+)
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.config import get_stream_writer
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from mcp.client.streamable_http import StreamableHTTPError
 from mcp.shared.exceptions import McpError
 from typing_extensions import TypedDict
+
+from settings import settings
 
 logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
 
@@ -86,6 +95,17 @@ def _debug_payload(base: dict, **extra) -> dict:
     if not _DEBUG_MODE:
         return base
     return {**base, "debug": extra}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Think-Mode Delegation Log (per-request via ContextVar)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Tracks which agents were delegated to and their results within a single
+# request.  Used by think_tool to return a real state summary.  ContextVar
+# provides per-request isolation so the cached singleton graph stays safe.
+_think_delegation_log_var: contextvars.ContextVar[list[dict] | None] = (
+    contextvars.ContextVar("think_delegation_log", default=None)
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MCP Connectivity Error Handler for ToolNode
@@ -166,26 +186,25 @@ def handle_mcp_tool_errors(e: Exception) -> str:
 #  Config
 # ══════════════════════════════════════════════════════════════════════════════
 
-FIRECRAWL_API_KEY = os.environ["FIRECRAWL_API_KEY"]
-FIRECRAWL_MCP_URL = f"https://mcp.firecrawl.dev/{FIRECRAWL_API_KEY}/v2/mcp"
-LANGCHAIN_DOCS_MCP_URL = "https://docs.langchain.com/mcp"
-GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-MAX_AGENT_STEPS = int(os.environ.get("MAX_AGENT_STEPS", "25"))
-MAX_SUBAGENT_STEPS = int(os.environ.get("MAX_SUBAGENT_STEPS", "50"))
-MAX_RESOLUTION_ROUNDS = int(os.environ.get("MAX_RESOLUTION_ROUNDS", "2"))
-ORCHESTRATOR_MODE = os.environ.get("ORCHESTRATOR_MODE", "evaluator").strip().lower()
+# All env-var config is validated centrally in settings.py.
+# Local aliases keep the rest of this file concise.
+GOOGLE_API_KEY = settings.google_api_key.get_secret_value()
+GEMINI_MODEL = settings.gemini_model
+MAX_AGENT_STEPS = settings.max_agent_steps
+MAX_SUBAGENT_STEPS = settings.max_subagent_steps
+MAX_RESOLUTION_ROUNDS = settings.max_resolution_rounds
+ORCHESTRATOR_MODE = settings.orchestrator_mode
 
-MCP_CONNECTIONS: dict[str, dict] = {
-    "firecrawl": {
-        "transport": "streamable_http",
-        "url": FIRECRAWL_MCP_URL,
-    },
-    "langchain_docs": {
-        "transport": "streamable_http",
-        "url": LANGCHAIN_DOCS_MCP_URL,
-    },
-}
+# Message trimming configuration.
+# Sub-agents run tool-heavy ReAct loops that can easily exceed the model's
+# context window.  We keep the most recent N messages (by count) and always
+# preserve the SystemMessage.  Using message-count (token_counter=len) is
+# cheap and predictable; for token-precise trimming, swap to
+# token_counter="approximate" and adjust the max_tokens value.
+MAX_SUBAGENT_MESSAGES = settings.max_subagent_messages
+MAX_ORCHESTRATOR_MESSAGES = settings.max_orchestrator_messages
+MCP_INIT_TIMEOUT = settings.mcp_init_timeout
+MCP_CONNECTIONS = settings.mcp_connections
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Agent Registry
@@ -263,6 +282,50 @@ def _partition_tools(all_tools: list) -> dict[str, list]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Message Trimming Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _trim_subagent_messages(msgs: list) -> list:
+    """Trim a sub-agent message list to at most MAX_SUBAGENT_MESSAGES.
+
+    Uses ``trim_messages`` with strategy="last" so we keep the most recent
+    exchanges.  ``include_system=True`` ensures the system prompt survives.
+    ``start_on=("human", "ai")`` prevents orphaned ToolMessages at the
+    start while allowing both human-initiated and mid-loop AI starts.
+    """
+    if len(msgs) <= MAX_SUBAGENT_MESSAGES:
+        return msgs
+    return trim_messages(
+        msgs,
+        max_tokens=MAX_SUBAGENT_MESSAGES,
+        token_counter=len,
+        strategy="last",
+        include_system=True,
+        start_on=("human", "ai"),
+    )
+
+
+def _trim_orchestrator_messages(msgs: list) -> list:
+    """Trim the think-mode orchestrator message list.
+
+    The orchestrator accumulates its own LLM replies plus tool results from
+    delegate / think_tool calls.  We keep a larger window than sub-agents
+    because the orchestrator needs more conversational context.
+    """
+    if len(msgs) <= MAX_ORCHESTRATOR_MESSAGES:
+        return msgs
+    return trim_messages(
+        msgs,
+        max_tokens=MAX_ORCHESTRATOR_MESSAGES,
+        token_counter=len,
+        strategy="last",
+        include_system=True,
+        start_on=("human", "ai"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  State Schemas
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -313,6 +376,9 @@ def _build_subagent_graph(
         msgs = list(state["messages"])
         if not any(isinstance(m, SystemMessage) for m in msgs):
             msgs.insert(0, SystemMessage(content=system_prompt))
+
+        # Trim to prevent context window overflow in long ReAct loops
+        msgs = _trim_subagent_messages(msgs)
 
         response: AIMessage = await llm.ainvoke(msgs)
 
@@ -450,18 +516,28 @@ async def _invoke_agent(
     # Use astream with custom mode so sub-agent tool_call / tool_result
     # events propagate to the parent SSE stream.
     final_messages = []
-    async for mode, chunk in entry["graph"].astream(
-        {"messages": messages},
-        stream_mode=["custom", "updates"],
-        config={"recursion_limit": MAX_SUBAGENT_STEPS},
-    ):
-        if mode == "custom":
-            # Forward sub-agent custom events (tool_call, tool_result, etc.)
-            writer(chunk)
-        elif mode == "updates":
-            for _node_name, state_delta in chunk.items():
-                for msg in state_delta.get("messages", []):
-                    final_messages.append(msg)
+    try:
+        async for mode, chunk in entry["graph"].astream(
+            {"messages": messages},
+            stream_mode=["custom", "updates"],
+            config={"recursion_limit": MAX_SUBAGENT_STEPS},
+        ):
+            if mode == "custom":
+                # Forward sub-agent custom events (tool_call, tool_result, etc.)
+                writer(chunk)
+            elif mode == "updates":
+                for _node_name, state_delta in chunk.items():
+                    for msg in state_delta.get("messages", []):
+                        final_messages.append(msg)
+    except GraphRecursionError:
+        logging.warning(
+            "Sub-agent '%s' hit recursion limit (%s steps)",
+            agent_name, MAX_SUBAGENT_STEPS,
+        )
+        writer({"type": "error",
+                "detail": f"The {agent_name} needed more research steps than allowed. "
+                           "Returning the best partial answer so far.",
+                "agent": agent_name})
     answer = _extract_final_answer(final_messages)
 
     writer({"type": "agent_end", "agent": agent_name,
@@ -972,6 +1048,27 @@ def build_think_orchestrator(registry: dict[str, dict]):
     ]
     agent_descriptions_block = "\n".join(agent_desc_lines)
 
+    # ── Delegation tracking ────────────────────────────────────────────────
+    #
+    # Per-request log shared between delegate() and think_tool() via
+    # ContextVar.  Each delegate call appends a record so think_tool
+    # can return a real state summary instead of a static string —
+    # forcing the LLM to process actual research results rather than
+    # hallucinating a reflection.
+    #
+    # The ContextVar is module-level (_think_delegation_log_var) so
+    # stream_agent() can reset it per request.  Each async request
+    # handler runs in its own context copy, so concurrent requests
+    # are isolated.
+
+    def _get_delegation_log() -> list[dict]:
+        """Get the per-request delegation log, creating it if needed."""
+        log = _think_delegation_log_var.get(None)
+        if log is None:
+            log = []
+            _think_delegation_log_var.set(log)
+        return log
+
     # ── Tools ─────────────────────────────────────────────────────────────
 
     @tool
@@ -988,9 +1085,56 @@ def build_think_orchestrator(registry: dict[str, dict]):
             reflection: Your analysis of findings, gaps, and next action.
 
         Returns:
-            Confirmation that reflection was recorded.
+            A structured summary of all delegations so far, including which
+            agents were consulted, their queries, and answer previews.
         """
-        return "Reflection recorded. Continue with your plan."
+        delegation_log = _get_delegation_log()
+
+        if not delegation_log:
+            return (
+                "Reflection noted. No delegations have been made yet.\n"
+                f"Available agents: {agent_names_str}\n"
+                "Decide which agent(s) to consult, or respond directly."
+            )
+
+        # Build a structured state summary from actual delegation results
+        total = len(delegation_log)
+        succeeded = sum(1 for d in delegation_log if d["status"] == "ok")
+        failed = total - succeeded
+        agents_consulted = sorted(set(d["agent"] for d in delegation_log))
+        agents_not_consulted = sorted(
+            set(agent_names) - set(d["agent"] for d in delegation_log)
+        )
+
+        lines = [
+            "═══ Research State Summary ═══",
+            f"Delegations: {total} total, {succeeded} succeeded, {failed} failed",
+            f"Agents consulted: {', '.join(agents_consulted)}",
+        ]
+        if agents_not_consulted:
+            lines.append(
+                f"Agents NOT yet consulted: {', '.join(agents_not_consulted)}"
+            )
+
+        lines.append("")
+        for i, entry in enumerate(delegation_log, 1):
+            status_icon = "✓" if entry["status"] == "ok" else "✗"
+            lines.append(f"── Delegation {i} [{status_icon}] ──")
+            lines.append(f"  Agent: {entry['agent']}")
+            lines.append(f"  Query: {entry['query']}")
+            # Show a meaningful preview — enough for the LLM to judge
+            # completeness without repeating the full answer
+            preview = entry["answer_preview"]
+            lines.append(f"  Result preview ({entry['answer_len']} chars total):")
+            lines.append(f"    {preview}")
+            lines.append("")
+
+        lines.append(
+            "Based on the above, decide: is the research sufficient to "
+            "answer the user's question, or do you need to delegate again "
+            "with a more focused query?"
+        )
+        return "\n".join(lines)
 
     @tool
     async def delegate(agent_name: str, query: str) -> str:
@@ -1007,10 +1151,18 @@ def build_think_orchestrator(registry: dict[str, dict]):
             The agent's research findings.
         """
         if agent_name not in registry:
-            return (
+            error_msg = (
                 f"Unknown agent '{agent_name}'. "
                 f"Available agents: {agent_names_str}"
             )
+            _get_delegation_log().append({
+                "agent": agent_name,
+                "query": query,
+                "answer_preview": error_msg,
+                "answer_len": 0,
+                "status": "error",
+            })
+            return error_msg
 
         entry = registry[agent_name]
         writer = get_stream_writer()
@@ -1024,18 +1176,39 @@ def build_think_orchestrator(registry: dict[str, dict]):
         # Use astream with custom mode so sub-agent tool_call / tool_result
         # events propagate to the parent SSE stream.
         final_messages = []
-        async for mode, chunk in entry["graph"].astream(
-            {"messages": [HumanMessage(content=query)]},
-            stream_mode=["custom", "updates"],
-            config={"recursion_limit": MAX_SUBAGENT_STEPS},
-        ):
-            if mode == "custom":
-                writer(chunk)
-            elif mode == "updates":
-                for _node_name, state_delta in chunk.items():
-                    for msg in state_delta.get("messages", []):
-                        final_messages.append(msg)
+        hit_limit = False
+        try:
+            async for mode, chunk in entry["graph"].astream(
+                {"messages": [HumanMessage(content=query)]},
+                stream_mode=["custom", "updates"],
+                config={"recursion_limit": MAX_SUBAGENT_STEPS},
+            ):
+                if mode == "custom":
+                    writer(chunk)
+                elif mode == "updates":
+                    for _node_name, state_delta in chunk.items():
+                        for msg in state_delta.get("messages", []):
+                            final_messages.append(msg)
+        except GraphRecursionError:
+            hit_limit = True
+            logging.warning(
+                "Sub-agent '%s' hit recursion limit (%s steps) for query: %s",
+                agent_name, MAX_SUBAGENT_STEPS, query[:200],
+            )
+            writer({"type": "error",
+                    "detail": f"The {agent_name} needed more research steps than allowed. "
+                               "Returning the best partial answer so far.",
+                    "agent": agent_name})
         answer = _extract_final_answer(final_messages)
+
+        # Track delegation for think_tool state summary
+        _get_delegation_log().append({
+            "agent": agent_name,
+            "query": query,
+            "answer_preview": answer[:500] + ("…" if len(answer) > 500 else ""),
+            "answer_len": len(answer),
+            "status": "truncated" if hit_limit else "ok",
+        })
 
         writer({"type": "agent_end", "agent": agent_name,
                 "summary": f"{agent_name} complete"})
@@ -1063,6 +1236,9 @@ def build_think_orchestrator(registry: dict[str, dict]):
         msgs = list(state["messages"])
         if not any(isinstance(m, SystemMessage) for m in msgs):
             msgs.insert(0, SystemMessage(content=system_prompt))
+
+        # Trim to prevent context window overflow in long research sessions
+        msgs = _trim_orchestrator_messages(msgs)
 
         response: AIMessage = await orch_llm.ainvoke(msgs)
 
@@ -1157,25 +1333,159 @@ def build_think_orchestrator(registry: dict[str, dict]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Singleton Graph Cache
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Optimization: build the MCP client, discover tools, and compile the
+# LangGraph orchestrator graph ONCE on first request, then reuse on
+# every subsequent request.  This avoids:
+#   - Reconnecting to every MCP server to list tools on each request
+#   - Rebuilding the full agent registry and LangGraph graph per request
+#
+# The compiled graph is stateless (state is passed in per invocation),
+# so sharing it across requests is safe.  Individual tool calls still
+# open their own MCP sessions (connection-per-call, built into the
+# langchain-mcp-adapters library).
+#
+# To force a rebuild (e.g. after adding a new MCP server), call
+# invalidate_graph_cache().
+
+_cached_graph = None
+_graph_lock = asyncio.Lock()
+
+# In-flight request tracking — used for graceful shutdown and safe cache
+# invalidation.  Each active stream_agent() generator increments on entry
+# and decrements on exit.
+_inflight_count: int = 0
+_inflight_lock = asyncio.Lock()
+_inflight_zero = asyncio.Event()    # set when count reaches 0
+_inflight_zero.set()                # initially zero → set
+_shutting_down: bool = False
+
+
+async def _get_or_build_graph():
+    """Return the cached orchestrator graph, building it on first call.
+
+    Uses asyncio.Lock to ensure only one coroutine builds the graph
+    even if multiple requests arrive concurrently at startup.
+    """
+    global _cached_graph
+    if _cached_graph is not None:
+        return _cached_graph
+
+    async with _graph_lock:
+        # Double-check after acquiring lock
+        if _cached_graph is not None:
+            return _cached_graph
+
+        logging.info("Building orchestrator graph (first request)...")
+        client = MultiServerMCPClient(MCP_CONNECTIONS)
+        try:
+            all_tools = await asyncio.wait_for(
+                client.get_tools(), timeout=MCP_INIT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"MCP tool discovery timed out after {MCP_INIT_TIMEOUT}s. "
+                f"One or more MCP servers in MCP_CONNECTIONS may be "
+                f"unreachable. Increase MCP_INIT_TIMEOUT or check server "
+                f"health."
+            )
+
+        tool_buckets = _partition_tools(all_tools)
+        registry = _build_agent_registry(tool_buckets)
+
+        if ORCHESTRATOR_MODE == "think":
+            graph = build_think_orchestrator(registry)
+        else:
+            graph = build_evaluator_orchestrator(registry)
+
+        _cached_graph = graph
+        logging.info("Orchestrator graph ready (mode=%s, tools=%d)",
+                     ORCHESTRATOR_MODE, len(all_tools))
+        return _cached_graph
+
+
+def invalidate_graph_cache() -> None:
+    """Force the orchestrator graph to be rebuilt on the next request.
+
+    Call this after changing MCP_CONNECTIONS or AGENT_CONFIGS at runtime.
+    In-flight requests continue using the old graph; the next request
+    triggers a fresh build.
+    """
+    global _cached_graph
+    _cached_graph = None
+    logging.info("Graph cache invalidated — will rebuild on next request")
+
+
+async def wait_for_inflight(timeout: float = 30.0) -> bool:
+    """Wait until all in-flight requests have completed.
+
+    Returns True if all requests finished within the timeout, False if
+    the timeout expired with requests still in progress.
+    """
+    try:
+        await asyncio.wait_for(_inflight_zero.wait(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Timed out waiting for in-flight requests (%d still active)",
+            _inflight_count,
+        )
+        return False
+
+
+def get_inflight_count() -> int:
+    """Return the current number of in-flight requests (for health checks)."""
+    return _inflight_count
+
+
+def is_shutting_down() -> bool:
+    """Return True if a graceful shutdown has been initiated."""
+    return _shutting_down
+
+
+def begin_shutdown() -> None:
+    """Mark the agent module as shutting down.
+
+    New requests via stream_agent() will be rejected with a shutdown
+    notice.  Existing in-flight requests are allowed to complete.
+    """
+    global _shutting_down
+    _shutting_down = True
+    logging.info("Shutdown initiated — rejecting new requests")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Stream Entrypoint
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 async def stream_agent(query: str):
     """Async generator that yields SSE strings from the orchestrator."""
+    global _inflight_count
+
+    # Reject new requests during graceful shutdown
+    if _shutting_down:
+        yield sse({"type": "error",
+                   "detail": "Server is shutting down. Please retry shortly."})
+        return
+
+    # Track in-flight requests for graceful shutdown / cache invalidation
+    async with _inflight_lock:
+        _inflight_count += 1
+        _inflight_zero.clear()
+
     try:
-        client = MultiServerMCPClient(MCP_CONNECTIONS)
-        all_tools = await client.get_tools()
+        graph = await _get_or_build_graph()
 
-        tool_buckets = _partition_tools(all_tools)
-        registry = _build_agent_registry(tool_buckets)
+        # Reset per-request delegation log for think-mode state tracking
+        _think_delegation_log_var.set(None)
 
-        # Build graph based on orchestrator mode
+        # Build per-request inputs
         if ORCHESTRATOR_MODE == "think":
-            graph = build_think_orchestrator(registry)
             inputs = {"messages": [HumanMessage(content=query)]}
         else:
-            graph = build_evaluator_orchestrator(registry)
             inputs = {
                 "messages": [HumanMessage(content=query)],
                 "intent": "",
@@ -1249,7 +1559,23 @@ async def stream_agent(query: str):
 
         yield sse({"type": "done"})
 
+    except GraphRecursionError:
+        logging.error(
+            "Orchestrator hit recursion limit (%s steps)", MAX_AGENT_STEPS
+        )
+        yield sse({"type": "error",
+                   "detail": "This question required more processing than the "
+                              "system allows. Try breaking it into smaller, "
+                              "more specific questions."})
     except Exception:
         logging.exception("stream_agent error")
         yield sse({"type": "error",
                    "detail": "An internal error occurred. Please try again."})
+    finally:
+        # Decrement in-flight counter so shutdown / cache-invalidation
+        # can know when all active streams have completed.
+        async with _inflight_lock:
+            _inflight_count -= 1
+            if _inflight_count <= 0:
+                _inflight_count = 0
+                _inflight_zero.set()

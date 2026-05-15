@@ -1,18 +1,27 @@
 """
 FastAPI application — routes, middleware, and mock data endpoints.
 
-POST /agent/conversation       → SSE stream from the orchestrator agent
-GET  /api/chat/history         → recent chat sessions (dummy)
-GET  /api/chat/search?q=...   → keyword search over chat history (dummy)
-GET  /api/incidents            → active incidents with AI root-cause analysis
-GET  /api/incidents/{id}       → detail for a single incident
-GET  /api/monitoring/health    → AI-scored service health map
-GET  /api/monitoring/anomalies → currently detected anomalies
-GET  /api/monitoring/predictions → predictive alerts (next 4 h)
+POST /agent/conversation             → SSE stream from the orchestrator agent
+GET  /api/debug                      → current debug mode state
+POST /api/admin/invalidate-cache     → force graph rebuild (requires X-API-Key)
+POST /api/admin/shutdown             → initiate graceful shutdown (requires X-API-Key)
+GET  /healthz                        → liveness probe (always 200)
+GET  /readyz                         → readiness probe (503 during shutdown)
+GET  /api/chat/history               → recent chat sessions (dummy)
+GET  /api/chat/search?q=...         → keyword search over chat history (dummy)
+GET  /api/incidents                  → active incidents with AI root-cause analysis
+GET  /api/incidents/{id}             → detail for a single incident
+GET  /api/monitoring/health          → AI-scored service health map
+GET  /api/monitoring/anomalies       → currently detected anomalies
+GET  /api/monitoring/predictions     → predictive alerts (next 4 h)
 """
 
-import os
+import asyncio
+import logging
 import random
+import secrets
+import signal
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -21,7 +30,7 @@ from tracing import setup_mlflow_tracing
 # Activate MLflow tracing *before* any LangChain / LangGraph imports
 setup_mlflow_tracing()
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,21 +38,112 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from agent import stream_agent, set_debug_mode
+from agent import (
+    begin_shutdown,
+    get_inflight_count,
+    invalidate_graph_cache,
+    is_shutting_down,
+    set_debug_mode,
+    stream_agent,
+    wait_for_inflight,
+)
+from settings import settings
 
-# ── Config ────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
-MAX_QUERY_LENGTH = int(os.environ.get("MAX_QUERY_LENGTH", "4000"))
-DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").strip().lower() in ("true", "1", "yes")
+# ── Config (validated centrally in settings.py) ───────────────────────────────
+
+ALLOWED_ORIGINS = settings.allowed_origins.split(",")
+MAX_QUERY_LENGTH = settings.max_query_length
+DEBUG_MODE = settings.debug_mode
+ADMIN_API_KEY = settings.admin_api_key
+SHUTDOWN_TIMEOUT = settings.shutdown_timeout
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
+
+# ── Admin Auth Dependency ──────────────────────────────────────────────────────────
+
+
+async def verify_admin_key(
+    x_api_key: str = Header(..., alias="X-API-Key"),
+) -> None:
+    """Validate the admin API key on /api/admin/* endpoints."""
+    if not secrets.compare_digest(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+# ── Lifespan (startup / shutdown + signal handlers) ───────────────────────
+
+
+def _handle_sighup() -> None:
+    """SIGHUP handler — reload config by invalidating the graph cache.
+
+    This lets operators send ``kill -HUP <pid>`` to trigger a hot-reload
+    of MCP connections and agent configs without a full restart.
+    In-flight requests continue with the old graph; the next request
+    builds a fresh graph from the (potentially updated) config.
+    """
+    logger.info("Received SIGHUP — invalidating graph cache for hot reload")
+    invalidate_graph_cache()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan handler for startup and graceful shutdown."""
+    # ── Startup ───────────────────────────────────────────────────────
+    logger.info("Starting up — orchestrator mode=%s",
+                settings.orchestrator_mode)
+
+    # Register signal handlers on the running event loop.
+    loop = asyncio.get_running_loop()
+
+    # SIGHUP → hot-reload config (invalidate graph cache)
+    try:
+        loop.add_signal_handler(signal.SIGHUP, _handle_sighup)
+    except (NotImplementedError, OSError):
+        # SIGHUP not available on Windows
+        logger.info("SIGHUP handler not available on this platform")
+
+    # SIGTERM / SIGINT → graceful shutdown is handled by uvicorn, but
+    # we hook into the lifespan shutdown phase below to drain in-flight
+    # requests before the process exits.
+
+    yield  # ─── application is running ───
+
+    # ── Shutdown ──────────────────────────────────────────────────────
+    logger.info("Shutdown initiated — draining in-flight requests...")
+    begin_shutdown()
+
+    inflight = get_inflight_count()
+    if inflight > 0:
+        logger.info(
+            "Waiting up to %.0fs for %d in-flight request(s) to complete",
+            SHUTDOWN_TIMEOUT, inflight,
+        )
+        drained = await wait_for_inflight(timeout=SHUTDOWN_TIMEOUT)
+        if drained:
+            logger.info("All in-flight requests completed — shutting down")
+        else:
+            logger.warning(
+                "Shutdown timeout expired with %d request(s) still active",
+                get_inflight_count(),
+            )
+    else:
+        logger.info("No in-flight requests — shutting down immediately")
+
+    # Invalidate the graph cache so any dangling references are released
+    invalidate_graph_cache()
+    logger.info("Shutdown complete")
+
+
+# ── FastAPI app ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="LangGraph Multi-Agent Streaming",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=lifespan,
 )
 
 # Propagate debug mode to agent module
@@ -56,7 +156,7 @@ app.add_middleware(
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 
@@ -109,6 +209,69 @@ async def agent_conversation(request: ChatRequest):
 async def get_debug_mode():
     """Returns the current debug mode state for the frontend."""
     return {"debug": DEBUG_MODE}
+
+
+@app.post("/api/admin/invalidate-cache", dependencies=[Depends(verify_admin_key)])
+async def admin_invalidate_cache():
+    """Force the orchestrator graph to be rebuilt on the next request.
+
+    Use after changing MCP server configs or agent registry at runtime.
+    Requires ``X-API-Key`` header matching the ADMIN_API_KEY env var.
+    """
+    inflight = get_inflight_count()
+    invalidate_graph_cache()
+    return {
+        "status": "ok",
+        "message": "Graph cache invalidated",
+        "inflight_requests": inflight,
+    }
+
+
+@app.post("/api/admin/shutdown", dependencies=[Depends(verify_admin_key)])
+async def admin_shutdown():
+    """Initiate graceful shutdown — reject new requests, drain in-flight.
+
+    This does NOT terminate the process; it signals the agent layer to
+    reject new requests while allowing in-flight ones to complete.
+    Pair with orchestration tools (Kubernetes, systemd) for full shutdown.
+    """
+    begin_shutdown()
+    return {
+        "status": "ok",
+        "message": "Shutdown initiated — new requests will be rejected",
+        "inflight_requests": get_inflight_count(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Health & Readiness
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe — always returns 200 if the process is running."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Readiness probe — returns 503 during graceful shutdown.
+
+    Kubernetes / load balancers should stop routing new traffic when
+    this returns non-200.  In-flight requests continue to completion.
+    """
+    if is_shutting_down():
+        return Response(
+            content='{"status": "shutting_down", "inflight": '
+                    + str(get_inflight_count()) + '}',
+            status_code=503,
+            media_type="application/json",
+        )
+    return {
+        "status": "ok",
+        "inflight_requests": get_inflight_count(),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

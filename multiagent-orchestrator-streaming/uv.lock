@@ -1049,6 +1049,7 @@ dependencies = [
     { name = "langgraph" },
     { name = "langgraph-prebuilt" },
     { name = "mlflow" },
+    { name = "pydantic-settings" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1062,6 +1063,7 @@ requires-dist = [
     { name = "langgraph", specifier = "==1.0.4" },
     { name = "langgraph-prebuilt", specifier = "==1.0.4" },
     { name = "mlflow", specifier = "==3.7.0" },
+    { name = "pydantic-settings", specifier = ">=2.14.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
 ]
 
