@@ -1,0 +1,273 @@
+"""
+FastAPI application — routes, middleware, and mock data endpoints.
+
+POST /agent/conversation       → SSE stream from the orchestrator agent
+GET  /api/chat/history         → recent chat sessions (dummy)
+GET  /api/chat/search?q=...   → keyword search over chat history (dummy)
+GET  /api/incidents            → active incidents with AI root-cause analysis
+GET  /api/incidents/{id}       → detail for a single incident
+GET  /api/monitoring/health    → AI-scored service health map
+GET  /api/monitoring/anomalies → currently detected anomalies
+GET  /api/monitoring/predictions → predictive alerts (next 4 h)
+"""
+
+import os
+import random
+from datetime import datetime, timedelta
+from typing import Optional
+
+from tracing import setup_mlflow_tracing
+
+# Activate MLflow tracing *before* any LangChain / LangGraph imports
+setup_mlflow_tracing()
+
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+from agent import stream_agent, set_debug_mode
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+MAX_QUERY_LENGTH = int(os.environ.get("MAX_QUERY_LENGTH", "4000"))
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").strip().lower() in ("true", "1", "yes")
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="LangGraph Multi-Agent Streaming",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+# Propagate debug mode to agent module
+set_debug_mode(DEBUG_MODE)
+
+# ── Middleware ────────────────────────────────────────────────────────────────
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# ── Static files ──────────────────────────────────────────────────────────────
+
+app.mount("/agent/copilot", StaticFiles(directory="static", html=True), name="copilot")
+
+# ── Request model ─────────────────────────────────────────────────────────────
+
+
+class ChatRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Agent Conversation Endpoint
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/agent/conversation")
+async def agent_conversation(request: ChatRequest):
+    return StreamingResponse(
+        stream_agent(request.query),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Debug Mode Endpoint
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/debug")
+async def get_debug_mode():
+    """Returns the current debug mode state for the frontend."""
+    return {"debug": DEBUG_MODE}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Chat History (dummy — replace with real service later)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DUMMY_HISTORY = [
+    {
+        "id": "chat-001",
+        "title": "Kubernetes security hardening",
+        "preview": "How to resolve a security vulnerability in a Kubernetes cluster?",
+        "timestamp": (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z",
+        "messageCount": 4,
+    },
+    {
+        "id": "chat-002",
+        "title": "Debugging CrashLoopBackOff",
+        "preview": "My pod keeps crashing with CrashLoopBackOff — how do I debug it?",
+        "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat() + "Z",
+        "messageCount": 6,
+    },
+    {
+        "id": "chat-003",
+        "title": "GPU scheduling issues",
+        "preview": "Pods requesting nvidia.com/gpu are stuck Pending…",
+        "timestamp": (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z",
+        "messageCount": 8,
+    },
+    {
+        "id": "chat-004",
+        "title": "LangGraph streaming setup",
+        "preview": "How do I set up SSE streaming with LangGraph and FastAPI?",
+        "timestamp": (datetime.utcnow() - timedelta(days=2)).isoformat() + "Z",
+        "messageCount": 3,
+    },
+    {
+        "id": "chat-005",
+        "title": "Helm chart best practices",
+        "preview": "What are the best practices for structuring Helm charts?",
+        "timestamp": (datetime.utcnow() - timedelta(days=3)).isoformat() + "Z",
+        "messageCount": 5,
+    },
+    {
+        "id": "chat-006",
+        "title": "Istio service mesh debugging",
+        "preview": "Sidecar injection is failing silently in my namespace.",
+        "timestamp": (datetime.utcnow() - timedelta(days=5)).isoformat() + "Z",
+        "messageCount": 7,
+    },
+]
+
+
+@app.get("/api/chat/history")
+async def chat_history():
+    return _DUMMY_HISTORY
+
+
+@app.get("/api/chat/search")
+async def chat_search(q: Optional[str] = Query(default="")):
+    if not q or not q.strip():
+        return []
+    needle = q.strip().lower()
+    results = []
+    for chat in _DUMMY_HISTORY:
+        title_lower = chat["title"].lower()
+        preview_lower = chat["preview"].lower()
+        if needle in title_lower or needle in preview_lower:
+            results.append({
+                **chat,
+                "highlight": chat["title"] if needle in title_lower else chat["preview"],
+            })
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AI Insights — Incidents
+# ══════════════════════════════════════════════════════════════════════════════
+
+_INCIDENTS = [
+    {
+        "id": "INC-4821", "severity": "P1", "title": "Payment Gateway 5xx Spike",
+        "service": "payment-svc", "status": "investigating", "duration": "18m",
+        "aiRootCause": "Connection pool exhaustion due to upstream Stripe API latency spike",
+        "confidence": 94,
+        "blastRadius": ["checkout-flow", "order-svc", "~12K users/min"],
+    },
+    {
+        "id": "INC-4822", "severity": "P1", "title": "Redis Cluster Failover",
+        "service": "redis-cluster", "status": "escalated", "duration": "42m",
+        "aiRootCause": "OOM kill on primary node, replica promoted with 4min lag",
+        "confidence": 97,
+        "blastRadius": ["auth-svc", "session-mgr", "~45K sessions"],
+    },
+    {
+        "id": "INC-4823", "severity": "P1", "title": "GPU Node NotReady",
+        "service": "k8s-gpu-pool", "status": "mitigating", "duration": "55m",
+        "aiRootCause": "NVIDIA driver crash after kernel update",
+        "confidence": 89,
+        "blastRadius": ["ml-inference", "model-serving", "8 GPU pods"],
+    },
+]
+
+
+@app.get("/api/incidents")
+async def get_incidents(severity: Optional[str] = Query(default=None)):
+    incidents = _INCIDENTS
+    if severity:
+        incidents = [i for i in incidents if i["severity"] == severity]
+    return incidents
+
+
+@app.get("/api/incidents/{incident_id}")
+async def get_incident_detail(incident_id: str):
+    for inc in _INCIDENTS:
+        if inc["id"] == incident_id:
+            return inc
+    return {"error": "Incident not found"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AI Monitoring — Proactive
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SERVICES = [
+    {"name": "api-gateway", "status": "healthy", "score": 98.5, "cpu": "34%", "mem": "62%", "latency": "12ms", "errRate": "0.01%"},
+    {"name": "payment-svc", "status": "critical", "score": 42.1, "cpu": "94%", "mem": "87%", "latency": "4200ms", "errRate": "34.7%"},
+    {"name": "auth-svc", "status": "degraded", "score": 71.3, "cpu": "67%", "mem": "78%", "latency": "340ms", "errRate": "2.1%"},
+    {"name": "order-svc", "status": "healthy", "score": 96.2, "cpu": "28%", "mem": "55%", "latency": "45ms", "errRate": "0.05%"},
+    {"name": "ml-inference", "status": "critical", "score": 31.2, "cpu": "12%", "mem": "34%", "latency": "timeout", "errRate": "89.2%"},
+    {"name": "redis-cluster", "status": "degraded", "score": 68.5, "cpu": "45%", "mem": "92%", "latency": "8ms", "errRate": "0.5%"},
+]
+
+_ANOMALIES = [
+    {"type": "critical", "title": "Memory leak — payment-svc", "service": "payment-svc", "metric": "87% → 91%"},
+    {"type": "warning", "title": "Error rate spike — search-svc", "service": "search-svc", "metric": "0.1% → 1.4%"},
+    {"type": "warning", "title": "CPU anomaly — api-gateway", "service": "api-gateway", "metric": "34% (expected 18-22%)"},
+]
+
+
+@app.get("/api/monitoring/health")
+async def get_service_health():
+    for svc in _SERVICES:
+        if svc["status"] == "healthy":
+            svc["score"] = round(min(100, max(80, svc["score"] + random.uniform(-0.5, 0.5))), 1)
+    return {
+        "overallScore": round(sum(s["score"] for s in _SERVICES) / len(_SERVICES), 1),
+        "services": _SERVICES,
+    }
+
+
+@app.get("/api/monitoring/anomalies")
+async def get_anomalies():
+    return _ANOMALIES
+
+
+@app.get("/api/monitoring/predictions")
+async def get_predictions():
+    return [
+        {"type": "capacity", "title": "Redis memory exhaustion in ~2.1h", "confidence": "91%", "eta": "2.1h"},
+        {"type": "failure", "title": "payment-svc OOM crash in ~47min", "confidence": "87%", "eta": "47min"},
+        {"type": "scaling", "title": "Traffic surge expected at 16:00 UTC", "confidence": "82%", "eta": "1.5h"},
+    ]

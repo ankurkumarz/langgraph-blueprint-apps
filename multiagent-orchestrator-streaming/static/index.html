@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SRE & Ops L1 Agent</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ── Left sidebar ── -->
+  <aside id="sidebar">
+
+    <!-- Sidebar header -->
+    <div class="sidebar-top">
+      <div class="sidebar-logo">🔗</div>
+      <button id="new-chat-btn" class="sidebar-btn primary" title="New chat">
+        <span class="sidebar-btn-icon">✚</span>
+        <span class="sidebar-btn-label">New Chat</span>
+      </button>
+    </div>
+
+    <!-- Search bar -->
+    <div class="sidebar-search">
+      <span class="sidebar-search-icon">🔍</span>
+      <input id="search-input" type="text" placeholder="Search chats…" autocomplete="off" />
+    </div>
+
+    <!-- Nav links -->
+    <nav class="sidebar-nav">
+      <button id="history-btn" class="sidebar-nav-btn active" title="Chat history">
+        <span class="sidebar-nav-icon">🕘</span>
+        <span class="sidebar-nav-label">History</span>
+      </button>
+    </nav>
+
+    <!-- History list (always visible in sidebar) -->
+    <div id="history-list" class="sidebar-history">
+      <div class="sidebar-empty">Loading…</div>
+    </div>
+
+    <!-- Search results (shown when searching) -->
+    <div id="search-results" class="sidebar-history" style="display:none;">
+    </div>
+
+  </aside>
+
+  <!-- ── Right content area ── -->
+  <div id="content">
+
+    <!-- Header -->
+    <header>
+      <div>
+        <h1>SRE & Ops L1 Agent</h1>
+        <div class="subtitle">Smart AI assistant</div>
+      </div>
+
+      <!-- ── Top-bar nav tabs ── -->
+      <nav id="top-tabs">
+        <button class="top-tab active" data-tab="chat">
+          <span class="top-tab-icon">💬</span> Chat
+        </button>
+        <button class="top-tab" data-tab="insights">
+          <span class="top-tab-icon">🔥</span> AI Insights <span class="tab-label-sub">(Incidents)</span>
+        </button>
+        <button class="top-tab" data-tab="monitoring">
+          <span class="top-tab-icon">📡</span> AI Monitoring <span class="tab-label-sub">(Proactive)</span>
+        </button>
+      </nav>
+
+      <!-- Debug mode toggle (visible only when server DEBUG_MODE=true) -->
+      <div id="debug-toggle-wrap" style="display:none">
+        <button id="debug-toggle" class="debug-toggle-btn" title="Toggle debug panel — shows raw tool calls, graph node state, and full SSE events">
+          <span class="debug-toggle-icon">🐛</span>
+          <span class="debug-toggle-label">Debug</span>
+          <span class="debug-toggle-state" id="debug-state">OFF</span>
+        </button>
+      </div>
+
+      <div id="header-stats">
+        <span>Queries <b id="stat-queries">0</b></span>
+        <span>Tools <b id="stat-tools">0</b></span>
+        <span>Avg <b id="stat-avg">—</b></span>
+      </div>
+    </header>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         Tab: Chat (existing)
+         ════════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-chat" class="tab-content active">
+      <div id="main">
+        <div id="chat-scroll">
+          <div id="chat-inner">
+            <!-- Welcome screen -->
+            <div class="placeholder" id="placeholder">
+              <img class="icon" src="chatbot.png" alt="Chatbot" />
+              <p>Ask anything — watch the agent think, search, and reason before answering.</p>
+              <div class="sample-cards">
+                <div class="sample-card" data-query="How to resolve a security vulnerability in a Kubernetes cluster?">
+                  <div class="card-icon security">🔒</div>
+                  <div class="card-text">How to resolve a Security Issue</div>
+                </div>
+                <div class="sample-card" data-query="How to debug a LangGraph agent?">
+                  <div class="card-icon debug">🐛</div>
+                  <div class="card-text">How to Debug LangGraph Agent</div>
+                </div>
+                <div class="sample-card" data-query="How to troubleshoot GPU allocation and driver issues in Kubernetes?">
+                  <div class="card-icon gpu">🖥️</div>
+                  <div class="card-text">How to troubleshoot GPU issue</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Input bar -->
+        <div id="input-bar">
+          <div id="input-inner">
+            <textarea id="query" rows="1" placeholder="Ask a question… (Enter to send)" autofocus></textarea>
+            <button id="send-btn">Send ↑</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         Tab: AI Insights (Incidents)
+         ════════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-insights" class="tab-content">
+      <div class="dashboard-scroll">
+        <div class="dashboard-container">
+
+          <!-- ── Top KPI strip ── -->
+          <div class="kpi-strip">
+            <div class="kpi-card kpi-critical">
+              <div class="kpi-icon">🔴</div>
+              <div class="kpi-data">
+                <div class="kpi-value" id="kpi-active-p1">3</div>
+                <div class="kpi-label">Active P1s</div>
+              </div>
+              <div class="kpi-trend down">↑ 2 from yesterday</div>
+            </div>
+            <div class="kpi-card kpi-warning">
+              <div class="kpi-icon">🟡</div>
+              <div class="kpi-data">
+                <div class="kpi-value" id="kpi-active-p2">7</div>
+                <div class="kpi-label">Active P2/P3</div>
+              </div>
+              <div class="kpi-trend stable">— same as yesterday</div>
+            </div>
+            <div class="kpi-card kpi-success">
+              <div class="kpi-icon">⏱️</div>
+              <div class="kpi-data">
+                <div class="kpi-value" id="kpi-mttr">23m</div>
+                <div class="kpi-label">AI-Assisted MTTR</div>
+              </div>
+              <div class="kpi-trend up">↓ 38% vs manual</div>
+            </div>
+            <div class="kpi-card kpi-info">
+              <div class="kpi-icon">🤖</div>
+              <div class="kpi-data">
+                <div class="kpi-value" id="kpi-auto-resolved">12</div>
+                <div class="kpi-label">Auto-Resolved (24h)</div>
+              </div>
+              <div class="kpi-trend up">↑ 4 from yesterday</div>
+            </div>
+            <div class="kpi-card kpi-info">
+              <div class="kpi-icon">🎯</div>
+              <div class="kpi-data">
+                <div class="kpi-value">94%</div>
+                <div class="kpi-label">RCA Accuracy</div>
+              </div>
+              <div class="kpi-trend up">↑ 3% this week</div>
+            </div>
+          </div>
+
+          <!-- ── Active Incidents Table ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">🔥</span> Active Incidents — AI Analysis</h2>
+              <div class="section-actions">
+                <select id="incident-filter" class="dash-select">
+                  <option value="all">All Severities</option>
+                  <option value="P1">P1 — Critical</option>
+                  <option value="P2">P2 — High</option>
+                  <option value="P3">P3 — Medium</option>
+                </select>
+                <button class="dash-btn" id="refresh-incidents-btn">↻ Refresh</button>
+              </div>
+            </div>
+            <div class="incident-table-wrap">
+              <table class="incident-table" id="incident-table">
+                <thead>
+                  <tr>
+                    <th>Severity</th>
+                    <th>Incident</th>
+                    <th>Service</th>
+                    <th>AI Root Cause</th>
+                    <th>Blast Radius</th>
+                    <th>AI Confidence</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="incident-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- ── Two-column: AI RCA + Similar Incidents ── -->
+          <div class="dash-row">
+
+            <!-- AI Root Cause Analysis Detail -->
+            <div class="dash-section flex-1">
+              <div class="section-header">
+                <h2><span class="sh-icon">🧠</span> AI Root Cause Analysis</h2>
+              </div>
+              <div id="rca-detail" class="rca-panel">
+                <div class="rca-empty">Select an incident to view AI-generated root cause analysis</div>
+              </div>
+            </div>
+
+            <!-- Similar Incidents / Pattern Detection -->
+            <div class="dash-section flex-1">
+              <div class="section-header">
+                <h2><span class="sh-icon">🔗</span> Similar Incidents & Patterns</h2>
+              </div>
+              <div id="similar-incidents" class="similar-panel">
+                <div class="rca-empty">Select an incident to see AI-detected patterns</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Ticket Analysis / Noise Reduction ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">📊</span> AI Ticket Intelligence — Noise Reduction & Correlation</h2>
+            </div>
+            <div class="ticket-intel-grid">
+              <div class="ticket-intel-card">
+                <div class="ti-header">
+                  <span class="ti-icon">🔕</span>
+                  <span class="ti-title">Noise Reduction</span>
+                </div>
+                <div class="ti-stat">
+                  <span class="ti-big-num">67%</span>
+                  <span class="ti-desc">alerts suppressed as duplicates</span>
+                </div>
+                <div class="ti-bar-wrap">
+                  <div class="ti-bar" style="width:67%"></div>
+                </div>
+                <div class="ti-detail">342 of 511 alerts auto-correlated into 14 incident groups</div>
+              </div>
+              <div class="ticket-intel-card">
+                <div class="ti-header">
+                  <span class="ti-icon">🔄</span>
+                  <span class="ti-title">Cross-Service Correlation</span>
+                </div>
+                <div class="ti-stat">
+                  <span class="ti-big-num">8</span>
+                  <span class="ti-desc">clusters detected across services</span>
+                </div>
+                <div class="ti-clusters" id="correlation-clusters"></div>
+              </div>
+              <div class="ticket-intel-card">
+                <div class="ti-header">
+                  <span class="ti-icon">⚡</span>
+                  <span class="ti-title">Auto-Remediation Queue</span>
+                </div>
+                <div class="ti-remediation-list" id="remediation-queue"></div>
+              </div>
+              <div class="ticket-intel-card">
+                <div class="ti-header">
+                  <span class="ti-icon">📈</span>
+                  <span class="ti-title">Incident Trend (7 days)</span>
+                </div>
+                <div class="ti-chart" id="incident-trend-chart"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Runbook Suggestions ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">📖</span> AI-Suggested Runbooks & Actions</h2>
+            </div>
+            <div class="runbook-grid" id="runbook-grid"></div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         Tab: AI Monitoring (Proactive)
+         ════════════════════════════════════════════════════════════════════════ -->
+    <div id="tab-monitoring" class="tab-content">
+      <div class="dashboard-scroll">
+        <div class="dashboard-container">
+
+          <!-- ── Proactive KPI strip ── -->
+          <div class="kpi-strip">
+            <div class="kpi-card kpi-success">
+              <div class="kpi-icon">💚</div>
+              <div class="kpi-data">
+                <div class="kpi-value">96.2</div>
+                <div class="kpi-label">Overall Health Score</div>
+              </div>
+              <div class="kpi-trend up">↑ 1.3 from last hour</div>
+            </div>
+            <div class="kpi-card kpi-warning">
+              <div class="kpi-icon">⚠️</div>
+              <div class="kpi-data">
+                <div class="kpi-value">5</div>
+                <div class="kpi-label">Anomalies Detected</div>
+              </div>
+              <div class="kpi-trend down">↑ 2 from last hour</div>
+            </div>
+            <div class="kpi-card kpi-info">
+              <div class="kpi-icon">🔮</div>
+              <div class="kpi-data">
+                <div class="kpi-value">3</div>
+                <div class="kpi-label">Predictive Alerts</div>
+              </div>
+              <div class="kpi-trend stable">capacity warnings</div>
+            </div>
+            <div class="kpi-card kpi-success">
+              <div class="kpi-icon">🛡️</div>
+              <div class="kpi-data">
+                <div class="kpi-value">14</div>
+                <div class="kpi-label">Issues Prevented (24h)</div>
+              </div>
+              <div class="kpi-trend up">by proactive actions</div>
+            </div>
+            <div class="kpi-card kpi-info">
+              <div class="kpi-icon">💰</div>
+              <div class="kpi-data">
+                <div class="kpi-value">$12.4K</div>
+                <div class="kpi-label">Est. Cost Savings (mo)</div>
+              </div>
+              <div class="kpi-trend up">from right-sizing</div>
+            </div>
+          </div>
+
+          <!-- ── Service Health Map ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">🗺️</span> Service Health Map — AI Scored</h2>
+              <div class="section-actions">
+                <div class="live-indicator"><span class="live-pulse"></span> Live</div>
+                <button class="dash-btn" id="refresh-health-btn">↻ Refresh</button>
+              </div>
+            </div>
+            <div class="health-map-grid" id="health-map"></div>
+          </div>
+
+          <!-- ── Two-column: Anomaly Detection + Predictive Alerts ── -->
+          <div class="dash-row">
+            <div class="dash-section flex-1">
+              <div class="section-header">
+                <h2><span class="sh-icon">🔍</span> Anomaly Detection — Real-time</h2>
+              </div>
+              <div class="anomaly-list" id="anomaly-list"></div>
+            </div>
+            <div class="dash-section flex-1">
+              <div class="section-header">
+                <h2><span class="sh-icon">🔮</span> Predictive Alerts — Next 4 Hours</h2>
+              </div>
+              <div class="predictive-list" id="predictive-list"></div>
+            </div>
+          </div>
+
+          <!-- ── Resource Usage + Capacity Forecasting ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">📊</span> Resource Usage & Capacity Forecasting</h2>
+            </div>
+            <div class="resource-grid" id="resource-grid"></div>
+          </div>
+
+          <!-- ── Cost Optimization & Right-sizing ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">💡</span> AI-Powered Cost Optimization & Right-Sizing</h2>
+            </div>
+            <div class="cost-opt-grid" id="cost-opt-grid"></div>
+          </div>
+
+          <!-- ── Intelligent Auto-Scaling Recommendations ── -->
+          <div class="dash-section">
+            <div class="section-header">
+              <h2><span class="sh-icon">⚖️</span> Intelligent Auto-Scaling Recommendations</h2>
+            </div>
+            <div class="scaling-table-wrap">
+              <table class="incident-table" id="scaling-table">
+                <thead>
+                  <tr>
+                    <th>Service</th>
+                    <th>Current Replicas</th>
+                    <th>AI Recommended</th>
+                    <th>Reason</th>
+                    <th>Confidence</th>
+                    <th>Est. Impact</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="scaling-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Activity toggle FAB ── -->
+  <button id="activity-toggle" title="Activity log">
+    📋
+    <span id="activity-badge"></span>
+  </button>
+
+  <!-- ── Activity side panel (right) ── -->
+  <div id="activity-pane">
+    <div id="activity-header">
+      <div class="live-dot" id="live-dot"></div>
+      Activity Log
+      <span id="act-count"></span>
+      <button class="close-btn" id="close-activity">✕</button>
+    </div>
+    <div id="activity-scroll"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
