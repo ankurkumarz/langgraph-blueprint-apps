@@ -171,20 +171,17 @@ function renderMarkdown(src) {
 //  Debug Mode — Helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/** Fetch debug mode flag from server and show/hide the toggle. */
-async function initDebugMode() {
-  try {
-    const res = await fetch('/api/debug');
-    if (!res.ok) return;
-    const data = await res.json();
-    debugAvailable = !!data.debug;
-    if (debugAvailable) {
-      debugToggleWrap.style.display = '';
-      // Restore preference from localStorage
-      const saved = localStorage.getItem('debug_mode');
-      if (saved === 'true') toggleDebug(true);
-    }
-  } catch { /* server doesn't support debug endpoint — ignore */ }
+/** Initialise debug mode — no server dependency.
+ *  The toggle is always available; the user controls it purely client-side.
+ *  If the backend sends events with a `debug` field, they will be rendered
+ *  when the user has toggled debug ON.  No /api/debug call needed.
+ */
+function initDebugMode() {
+  debugAvailable = true;
+  debugToggleWrap.style.display = '';
+  // Restore preference from localStorage
+  const saved = localStorage.getItem('debug_mode');
+  if (saved === 'true') toggleDebug(true);
 }
 
 function toggleDebug(force) {
@@ -1000,6 +997,18 @@ async function send() {
   const thinkSteps = document.createElement('div');
   thinkSteps.className = 'thinking-steps';
   group.appendChild(thinkSteps);
+
+  // Show an immediate "Thinking…" placeholder so the user never sees an empty bar
+  const thinkingPlaceholder = document.createElement('div');
+  thinkingPlaceholder.className = 'think-step thinking-placeholder';
+  thinkingPlaceholder.innerHTML =
+    `<div class="think-icon thinking active">◆</div>` +
+    `<div class="think-body">` +
+      `<div class="think-label">Thinking<span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></div>` +
+    `</div>`;
+  thinkSteps.appendChild(thinkingPlaceholder);
+  scrollDown();
+
   const answerSection = document.createElement('div');
   answerSection.className = 'answer-section';
   answerSection.innerHTML = `<div class="agent-avatar">🤖</div><div class="answer-content"><div class="answer-body streaming"></div></div>`;
@@ -1033,6 +1042,10 @@ async function send() {
         if (!raw) continue;
         let evt;
         try { evt = JSON.parse(raw); } catch { continue; }
+        // Remove the initial "Thinking…" placeholder on first real event
+        if (thinkingPlaceholder.parentNode) {
+          thinkingPlaceholder.remove();
+        }
         handleEvent(evt, thinkSteps, answerBody, answerSection, group, startTime);
       }
     }

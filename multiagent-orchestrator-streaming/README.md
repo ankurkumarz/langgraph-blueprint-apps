@@ -78,7 +78,7 @@ graph LR
 
 ## Adding a New Agent
 
-Add one entry to `AGENT_CONFIGS` in `agent.py`:
+Add one entry to `AGENT_CONFIGS` in `app/agent.py`:
 
 ```python
 {
@@ -102,6 +102,7 @@ cp .env.example .env
 
 uv sync
 python main.py
+# or: uvicorn app.app:app --host 0.0.0.0 --port 8000
 ```
 
 Open `http://localhost:8000/agent/copilot` for the chat UI.
@@ -131,9 +132,13 @@ Open `http://localhost:8000/agent/copilot` for the chat UI.
 ## Project Structure
 
 ```
-agent.py    — orchestrator + sub-agents + registry + SSE streaming
-api.py      — FastAPI app, routes, CORS, static files
-main.py     — uvicorn entrypoint
-tracing.py  — MLflow integration (conditional on MLFLOW_ENABLED)
-static/     — chat UI
+main.py           — uvicorn entrypoint
+app/
+  __init__.py     — package marker
+  app.py          — FastAPI app, routes, CORS, middleware, static files
+  agent.py        — orchestrator + sub-agents + registry + SSE streaming
+  settings.py     — centralised config (pydantic-settings)
+  tracing.py      — MLflow integration (conditional on MLFLOW_ENABLED)
+static/           — chat UI (index.html, styles.css, app.js)
+pyproject.toml    — project metadata & dependencies
 ```

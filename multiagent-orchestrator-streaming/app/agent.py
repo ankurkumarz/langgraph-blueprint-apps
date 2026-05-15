@@ -73,7 +73,7 @@ from mcp.client.streamable_http import StreamableHTTPError
 from mcp.shared.exceptions import McpError
 from typing_extensions import TypedDict
 
-from settings import settings
+from app.settings import settings
 
 logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
 

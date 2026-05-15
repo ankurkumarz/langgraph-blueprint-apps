@@ -23,9 +23,10 @@ import secrets
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
-from tracing import setup_mlflow_tracing
+from app.tracing import setup_mlflow_tracing
 
 # Activate MLflow tracing *before* any LangChain / LangGraph imports
 setup_mlflow_tracing()
@@ -38,7 +39,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from agent import (
+from app.agent import (
     begin_shutdown,
     get_inflight_count,
     invalidate_graph_cache,
@@ -47,7 +48,7 @@ from agent import (
     stream_agent,
     wait_for_inflight,
 )
-from settings import settings
+from app.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,9 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 # ── Static files ──────────────────────────────────────────────────────────────
 
-app.mount("/agent/copilot", StaticFiles(directory="static", html=True), name="copilot")
+# Resolve static directory relative to the project root (one level above app/)
+_STATIC_DIR = str(Path(__file__).resolve().parent.parent / "static")
+app.mount("/agent/copilot", StaticFiles(directory=_STATIC_DIR, html=True), name="copilot")
 
 # ── Request model ─────────────────────────────────────────────────────────────
 
