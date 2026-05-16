@@ -184,6 +184,7 @@ app.mount("/agent/copilot", StaticFiles(directory=_STATIC_DIR, html=True), name=
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH)
+    debug: bool = Field(False, description="Include debug events in the SSE stream")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,7 +195,7 @@ class ChatRequest(BaseModel):
 @app.post("/agent/conversation")
 async def agent_conversation(request: ChatRequest):
     return StreamingResponse(
-        stream_agent(request.query),
+        stream_agent(request.query, include_debug_events=request.debug),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -1024,7 +1024,7 @@ async function send() {
     const res = await fetch('/agent/conversation', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query, debug: debugEnabled }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const reader  = res.body.getReader();

@@ -45,6 +45,14 @@ Orchestration events:
   {"type": "plan_step",    "step_id": "...", "status": "running|done"}
   {"type": "status",       "message": "...", "agent": "..."}
   {"type": "mcp_server",   "server": "...", "status": "connected|disconnected", "error?": "..."}
+
+Debug-only events (sent only when ``debug: true`` in the POST body):
+  {"type": "graph_state_update", "node": "...", "debug": {...}}
+  {"type": "node_response",      "node": "...", "debug": {...}}
+
+  Core events may also carry an extra ``debug`` field when debug is on.
+  Without ``debug: true``, these events and fields are stripped from the
+  stream — integrating apps receive only the core + orchestration events.
 """
 
 import asyncio
@@ -1461,8 +1469,17 @@ def begin_shutdown() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def stream_agent(query: str):
-    """Async generator that yields SSE strings from the orchestrator."""
+async def stream_agent(query: str, *, include_debug_events: bool = False):
+    """Async generator that yields SSE strings from the orchestrator.
+
+    Args:
+        query: The user's question.
+        include_debug_events: When True *and* DEBUG_MODE is enabled on the
+            server, debug-only events (``graph_state_update``,
+            ``node_response``) are included in the SSE stream.  When False
+            (the default) these events are suppressed so integrating apps
+            receive only the core protocol events.
+    """
     global _inflight_count
 
     # Reject new requests during graceful shutdown
@@ -1505,12 +1522,19 @@ async def stream_agent(query: str):
             config={"recursion_limit": MAX_AGENT_STEPS},
         ):
             if mode == "custom":
+                # Suppress debug-only events when the client hasn't opted in
+                if not include_debug_events and isinstance(chunk, dict):
+                    if chunk.get("type") in ("node_response", "graph_state_update"):
+                        continue
+                    # Strip verbose debug payloads from core events
+                    if "debug" in chunk:
+                        chunk = {k: v for k, v in chunk.items() if k != "debug"}
                 yield sse(chunk)
 
             elif mode == "updates":
                 for node_name, state_delta in chunk.items():
                     # Debug: emit raw graph node state updates
-                    if _DEBUG_MODE:
+                    if _DEBUG_MODE and include_debug_events:
                         debug_state = {}
                         for k, v in state_delta.items():
                             if k == "messages":
@@ -1545,7 +1569,7 @@ async def stream_agent(query: str):
                                     if msg.name.startswith(srv_key):
                                         server = srv_key
                                         break
-                            yield sse(_debug_payload(
+                            payload = _debug_payload(
                                 {
                                     "type": "tool_result",
                                     "name": msg.name,
@@ -1555,7 +1579,10 @@ async def stream_agent(query: str):
                                 },
                                 full_content=str(msg.content),
                                 tool_call_id=getattr(msg, "tool_call_id", None),
-                            ))
+                            )
+                            if not include_debug_events and "debug" in payload:
+                                payload = {k: v for k, v in payload.items() if k != "debug"}
+                            yield sse(payload)
 
         yield sse({"type": "done"})
 
