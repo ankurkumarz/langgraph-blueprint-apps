@@ -3,7 +3,7 @@ LangGraph multi-agent orchestrator.
 
 Architecture
 ────────────
-  OrchestratorAgent  ─►  Agent Registry  ─┬─►  DocumentAgent  (LangChain Docs MCP)
+  OrchestratorAgent  ─►  Agent Registry  ─┬─►  Doc and Knowledge Search Agent  (LangChain Docs MCP)
                                            ├─►  WebAgent       (Firecrawl MCP)
                                            └─►  ... (add more agents here)
 
@@ -227,15 +227,15 @@ MCP_CONNECTIONS = settings.mcp_connections
 
 AGENT_CONFIGS = [
     {
-        "name": "document_agent",
-        "role": "LangChain docs specialist",
+        "name": "doc_and_knowledge_search_agent",
+        "role": "Doc and Knowledge Search specialist",
         "description": (
-            "LangChain docs specialist — use for questions about "
+            "Doc and Knowledge Search specialist — use for questions about "
             "LangChain, LangGraph, LangSmith documentation, API "
             "references, how-to guides, tutorials, and concepts."
         ),
         "system_prompt": (
-            "You are **DocumentAgent**, a specialist in LangChain ecosystem "
+            "You are **Doc and Knowledge Search Agent**, a specialist in LangChain ecosystem "
             "documentation.\nYou have access to the LangChain documentation "
             "MCP server.\n\nInstructions:\n"
             "- Use the available tools to search and retrieve relevant documentation.\n"
@@ -246,7 +246,7 @@ AGENT_CONFIGS = [
         ),
         "mcp_server": "langchain_docs",
         "tool_prefix": "langchain_docs",
-        "evaluator_intent": "document",
+        "evaluator_intent": "doc_and_knowledge_search",
     },
     {
         "name": "web_agent",

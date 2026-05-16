@@ -39,7 +39,7 @@ graph TB
     end
 
     subgraph REGISTRY [Agent Registry — AGENT_CONFIGS]
-        DOC[Document Agent<br/><i>LangChain Docs MCP</i>]
+        DOC[Doc and Knowledge Search Agent<br/><i>LangChain Docs MCP</i>]
         WEB[Web Agent<br/><i>Firecrawl MCP</i>]
         MORE[... add more here]
     end

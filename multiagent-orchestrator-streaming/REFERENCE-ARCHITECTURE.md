@@ -135,7 +135,7 @@ The registry is the architectural keystone. Every agent is a dict with a fixed s
 ```python
 AGENT_CONFIGS = [
     {
-        "name": "document_agent",           # Unique identifier
+        "name": "doc_and_knowledge_search_agent",  # Unique identifier
         "role": "LangChain docs specialist", # Human-readable role (shown in UI)
         "description": "...",               # Used by think-mode LLM to decide delegation
         "system_prompt": "...",             # Injected into the sub-agent's ReAct loop
@@ -234,7 +234,7 @@ classify_intent
 EVALUATOR_SYSTEM_PROMPT = """
 Reply with EXACTLY one JSON object:
   {"status": "resolved"}
-  {"status": "needs_document_agent", "followup_query": "..."}
+  {"status": "needs_doc_and_knowledge_search_agent", "followup_query": "..."}
   {"status": "needs_web_agent", "followup_query": "..."}
 """
 ```
