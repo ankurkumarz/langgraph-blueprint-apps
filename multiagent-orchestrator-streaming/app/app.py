@@ -47,6 +47,7 @@ from app.agent import (
     set_debug_mode,
     stream_agent,
     wait_for_inflight,
+    warm_up,
 )
 from app.settings import settings
 
@@ -104,6 +105,18 @@ async def lifespan(app: FastAPI):
     except (NotImplementedError, OSError):
         # SIGHUP not available on Windows
         logger.info("SIGHUP handler not available on this platform")
+
+    # Eagerly build the orchestrator graph so the first user request is
+    # not delayed by MCP tool discovery (which can take up to
+    # MCP_INIT_TIMEOUT seconds).  Failure is logged but not fatal —
+    # the graph will be retried on the first actual request.
+    try:
+        await warm_up()
+        logger.info("Orchestrator graph pre-built successfully")
+    except Exception:
+        logger.exception(
+            "Orchestrator graph pre-build failed — will retry on first request"
+        )
 
     # SIGTERM / SIGINT → graceful shutdown is handled by uvicorn, but
     # we hook into the lifespan shutdown phase below to drain in-flight
@@ -168,6 +181,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "object-src 'none'; "
+            "base-uri 'self'"
+        )
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=63072000; includeSubDomains"
+        )
         return response
 
 
@@ -392,7 +416,7 @@ async def get_incident_detail(incident_id: str):
     for inc in _INCIDENTS:
         if inc["id"] == incident_id:
             return inc
-    return {"error": "Incident not found"}
+    raise HTTPException(status_code=404, detail="Incident not found")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -417,12 +441,13 @@ _ANOMALIES = [
 
 @app.get("/api/monitoring/health")
 async def get_service_health():
-    for svc in _SERVICES:
+    services = [dict(svc) for svc in _SERVICES]
+    for svc in services:
         if svc["status"] == "healthy":
             svc["score"] = round(min(100, max(80, svc["score"] + random.uniform(-0.5, 0.5))), 1)
     return {
-        "overallScore": round(sum(s["score"] for s in _SERVICES) / len(_SERVICES), 1),
-        "services": _SERVICES,
+        "overallScore": round(sum(s["score"] for s in services) / len(services), 1),
+        "services": services,
     }
 
 

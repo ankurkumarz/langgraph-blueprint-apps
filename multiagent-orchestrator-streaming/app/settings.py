@@ -27,7 +27,7 @@ import secrets
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to the project root (one level above app/)
@@ -105,16 +105,19 @@ class Settings(BaseSettings):
             generated = secrets.token_urlsafe(32)
             object.__setattr__(self, "admin_api_key", generated)
             logger.warning(
-                "No ADMIN_API_KEY set — generated ephemeral key: %s",
-                generated,
+                "No ADMIN_API_KEY set — generated ephemeral key. "
+                "Set ADMIN_API_KEY env var in production."
             )
         return self
 
     # ── Computed / derived ───────────────────────────────────────────
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def firecrawl_mcp_url(self) -> str:
+        # Firecrawl's remote MCP requires the key in the URL path.
+        # Kept as a plain @property (not @computed_field) so the URL —
+        # which embeds the secret — is never included in model_dump(),
+        # repr(), or Pydantic validation error messages.
         return (
             f"https://mcp.firecrawl.dev/"
             f"{self.firecrawl_api_key.get_secret_value()}/v2/mcp"
