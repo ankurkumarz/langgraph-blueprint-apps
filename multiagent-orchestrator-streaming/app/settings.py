@@ -105,8 +105,8 @@ class Settings(BaseSettings):
             generated = secrets.token_urlsafe(32)
             object.__setattr__(self, "admin_api_key", generated)
             logger.warning(
-                "No ADMIN_API_KEY set — generated ephemeral key: %s",
-                generated,
+                "No ADMIN_API_KEY set — generated ephemeral key. "
+                "Set ADMIN_API_KEY env var in production."
             )
         return self
 

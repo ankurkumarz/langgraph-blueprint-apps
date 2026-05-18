@@ -136,6 +136,18 @@ _MCP_CONNECTIVITY_EXCEPTIONS: tuple[type[Exception], ...] = (
     OSError,
 )
 
+# Strings injected into ToolMessage content by handle_mcp_tool_errors when
+# a connectivity failure is detected.  Used by tool_result_emitter nodes to
+# emit "mcp_server disconnected" SSE events so the frontend can show status.
+_MCP_CONNECTIVITY_MARKERS: tuple[str, ...] = (
+    "MCP server connection failed",
+    "MCP server timed out",
+    "MCP server returned HTTP",
+    "MCP StreamableHTTP transport error",
+    "MCP protocol error",
+    "Network connectivity error",
+)
+
 
 def handle_mcp_tool_errors(e: Exception) -> str:
     """Custom ToolNode error handler that provides actionable messages for
@@ -422,47 +434,12 @@ def _build_subagent_graph(
 
         return {"messages": [response]}
 
-    async def tool_result_emitter(state: SubAgentState) -> dict:
-        writer = get_stream_writer()
-        for msg in reversed(state["messages"]):
-            if not isinstance(msg, ToolMessage):
-                break
-            content_str = str(msg.content)
-            # Detect MCP connectivity failures in ToolMessage content and
-            # emit a disconnected event so the frontend can show status.
-            _MCP_CONNECTIVITY_MARKERS = (
-                "MCP server connection failed",
-                "MCP server timed out",
-                "MCP server returned HTTP",
-                "MCP StreamableHTTP transport error",
-                "MCP protocol error",
-                "Network connectivity error",
-            )
-            if any(marker in content_str for marker in _MCP_CONNECTIVITY_MARKERS):
-                writer({
-                    "type": "mcp_server",
-                    "server": mcp_server_key,
-                    "status": "disconnected",
-                    "error": content_str[:500],
-                })
-            writer(_debug_payload(
-                {
-                    "type": "tool_result",
-                    "name": msg.name,
-                    "content": content_str[:1000],
-                    "server": mcp_server_key,
-                    "agent": agent_name,
-                },
-                full_content=content_str,
-                tool_call_id=getattr(msg, "tool_call_id", None),
-            ))
-        return {"messages": []}
-
     builder = StateGraph(SubAgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(
         tools, handle_tool_errors=handle_mcp_tool_errors))
-    builder.add_node("tool_result_emitter", tool_result_emitter)
+    builder.add_node("tool_result_emitter",
+                     _make_tool_result_emitter(agent_name, mcp_server_key))
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", tools_condition)
     builder.add_edge("tools", "tool_result_emitter")
@@ -557,6 +534,48 @@ async def _invoke_agent(
 
 def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _make_tool_result_emitter(agent_name: str, mcp_server_key: str | None = None):
+    """Factory that returns a tool_result_emitter graph node.
+
+    Shared by sub-agent graphs and the think-mode orchestrator graph to avoid
+    duplicating the ToolMessage scanning and SSE-emission logic.
+
+    Args:
+        agent_name: Label attached to emitted SSE events (e.g. "web_agent").
+        mcp_server_key: MCP server name for connectivity events.  When None
+            (think-mode orchestrator) the server field is reported as "unknown".
+    """
+    async def tool_result_emitter(state: SubAgentState) -> dict:
+        writer = get_stream_writer()
+        for msg in reversed(state["messages"]):
+            if not isinstance(msg, ToolMessage):
+                break
+            content_str = str(msg.content)
+            if any(marker in content_str for marker in _MCP_CONNECTIVITY_MARKERS):
+                writer({
+                    "type": "mcp_server",
+                    "server": mcp_server_key or "unknown",
+                    "status": "disconnected",
+                    "error": content_str[:500],
+                })
+            payload: dict = {
+                "type": "tool_result",
+                "name": msg.name,
+                "content": content_str[:1000],
+                "agent": agent_name,
+            }
+            if mcp_server_key:
+                payload["server"] = mcp_server_key
+            writer(_debug_payload(
+                payload,
+                full_content=content_str,
+                tool_call_id=getattr(msg, "tool_call_id", None),
+            ))
+        return {"messages": []}
+
+    return tool_result_emitter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1292,46 +1311,12 @@ def build_think_orchestrator(registry: dict[str, dict]):
 
         return {"messages": [response]}
 
-    async def tool_result_emitter(state: SubAgentState) -> dict:
-        writer = get_stream_writer()
-        for msg in reversed(state["messages"]):
-            if not isinstance(msg, ToolMessage):
-                break
-            content_str = str(msg.content)
-            # Detect MCP connectivity failures surfaced through delegate
-            # tool results and emit a disconnected status event.
-            _MCP_CONNECTIVITY_MARKERS = (
-                "MCP server connection failed",
-                "MCP server timed out",
-                "MCP server returned HTTP",
-                "MCP StreamableHTTP transport error",
-                "MCP protocol error",
-                "Network connectivity error",
-            )
-            if any(marker in content_str for marker in _MCP_CONNECTIVITY_MARKERS):
-                writer({
-                    "type": "mcp_server",
-                    "server": "unknown",
-                    "status": "disconnected",
-                    "error": content_str[:500],
-                })
-            writer(_debug_payload(
-                {
-                    "type": "tool_result",
-                    "name": msg.name,
-                    "content": content_str[:500],
-                    "agent": "orchestrator",
-                },
-                full_content=content_str,
-                tool_call_id=getattr(msg, "tool_call_id", None),
-            ))
-        return {"messages": []}
-
     builder = StateGraph(SubAgentState)
     builder.add_node("orchestrator", orchestrator_agent_node)
     builder.add_node("tools", ToolNode(
         orchestrator_tools, handle_tool_errors=handle_mcp_tool_errors))
-    builder.add_node("tool_result_emitter", tool_result_emitter)
+    builder.add_node("tool_result_emitter",
+                     _make_tool_result_emitter("orchestrator"))
     builder.add_edge(START, "orchestrator")
     builder.add_conditional_edges("orchestrator", tools_condition)
     builder.add_edge("tools", "tool_result_emitter")
@@ -1462,6 +1447,16 @@ def begin_shutdown() -> None:
     global _shutting_down
     _shutting_down = True
     logging.info("Shutdown initiated — rejecting new requests")
+
+
+async def warm_up() -> None:
+    """Eagerly build the orchestrator graph during application startup.
+
+    Calling this from the FastAPI lifespan handler ensures MCP tool discovery
+    and graph compilation happen before the first user request arrives,
+    avoiding a cold-start delay of up to MCP_INIT_TIMEOUT seconds.
+    """
+    await _get_or_build_graph()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

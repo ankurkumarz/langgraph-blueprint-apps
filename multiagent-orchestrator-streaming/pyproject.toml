@@ -1,7 +1,7 @@
 [project]
 name = "langgraph-fastapi-streaming"
 version = "0.1.0"
-description = "Add your description here"
+description = "Registry-driven multi-agent LangGraph orchestrator with FastAPI SSE streaming"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
