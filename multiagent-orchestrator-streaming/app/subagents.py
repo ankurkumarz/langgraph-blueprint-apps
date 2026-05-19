@@ -453,7 +453,10 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _make_tool_result_emitter(agent_name: str, mcp_server_key: str | None = None):
+def _make_tool_result_emitter(
+    agent_name: str,
+    mcp_server_key: str | list[str] | None = None,
+):
     """Factory that returns a tool_result_emitter graph node.
 
     Shared by sub-agent graphs and the think-mode orchestrator graph to avoid
@@ -461,19 +464,37 @@ def _make_tool_result_emitter(agent_name: str, mcp_server_key: str | None = None
 
     Args:
         agent_name: Label attached to emitted SSE events (e.g. "web_agent").
-        mcp_server_key: MCP server name for connectivity events.  When None
-            (think-mode orchestrator) the server field is reported as "unknown".
+        mcp_server_key: MCP server name(s) for connectivity events.
+            - str: single server (current single-MCP subagent case)
+            - list[str]: multiple servers — server is derived from tool name prefix
+            - None: no MCP (think-mode orchestrator); server field is omitted
     """
+    # Normalise to list for uniform handling inside the closure.
+    _server_keys: list[str] = (
+        [mcp_server_key] if isinstance(mcp_server_key, str)
+        else (mcp_server_key or [])
+    )
+
+    def _resolve_server(tool_name: str | None) -> str | None:
+        """Return the server key whose prefix matches the tool name."""
+        if not tool_name or not _server_keys:
+            return None
+        for key in _server_keys:
+            if tool_name.startswith(key):
+                return key
+        return _server_keys[0] if len(_server_keys) == 1 else None
+
     async def tool_result_emitter(state: SubAgentState) -> dict:
         writer = get_stream_writer()
         for msg in reversed(state["messages"]):
             if not isinstance(msg, ToolMessage):
                 break
             content_str = str(msg.content)
+            server = _resolve_server(msg.name)
             if any(marker in content_str for marker in _MCP_CONNECTIVITY_MARKERS):
                 writer({
                     "type": "mcp_server",
-                    "server": mcp_server_key or "unknown",
+                    "server": server or "unknown",
                     "status": "disconnected",
                     "error": content_str[:500],
                 })
@@ -483,8 +504,8 @@ def _make_tool_result_emitter(agent_name: str, mcp_server_key: str | None = None
                 "content": content_str[:1000],
                 "agent": agent_name,
             }
-            if mcp_server_key:
-                payload["server"] = mcp_server_key
+            if server:
+                payload["server"] = server
             writer(_debug_payload(
                 payload,
                 full_content=content_str,
