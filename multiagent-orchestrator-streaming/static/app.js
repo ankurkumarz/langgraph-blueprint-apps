@@ -707,6 +707,21 @@ function handleEvent(evt, thinkSteps, answerBody, answerSection, group, startTim
       break;
     }
 
+    case 'text_chunk': {
+      const chunk = coerce(evt.content);
+      if (chunk) {
+        if (answerSection.style.display === 'none') {
+          thinkSteps.querySelectorAll('.think-icon.active').forEach(el => el.classList.remove('active'));
+          answerSection.style.display = 'flex';
+        }
+        if (!answerBody._rawMd) answerBody._rawMd = '';
+        answerBody._rawMd += chunk;
+        answerBody.innerHTML = renderMarkdown(answerBody._rawMd);
+        scrollDown();
+      }
+      break;
+    }
+
     case 'text': {
       const text = coerce(evt.content);
       if (text) {
@@ -722,10 +737,43 @@ function handleEvent(evt, thinkSteps, answerBody, answerSection, group, startTim
       break;
     }
 
+    case 'usage': {
+      if (evt.usage) answerBody._tokenUsage = evt.usage;
+      break;
+    }
+
     case 'done': {
+      thinkSteps.querySelectorAll('.think-icon.active').forEach(el => el.classList.remove('active'));
       answerBody.classList.remove('streaming');
       if (answerBody._rawMd) answerBody.innerHTML = renderMarkdown(answerBody._rawMd);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      // ── Lightbox footer ──────────────────────────────────────────────────
+      {
+        const u = answerBody._tokenUsage || {};
+        const totalTok = u.total_tokens || (u.input_tokens || 0) + (u.output_tokens || 0);
+        const fmtTokens = totalTok >= 1e6
+          ? (totalTok / 1e6).toFixed(2) + 'M'
+          : totalTok >= 1e3
+            ? (totalTok / 1e3).toFixed(1) + 'k'
+            : totalTok ? String(totalTok) : null;
+
+        // Gemini 2.5 Flash default rates ($/1M tokens)
+        const inRate  = 0.10 / 1e6;
+        const outRate = 0.40 / 1e6;
+        const rawCost = (u.input_tokens || 0) * inRate + (u.output_tokens || 0) * outRate;
+        const fmtCost = rawCost > 0 ? `$${rawCost.toFixed(4)}` : null;
+
+        const parts = [`${elapsed}s`];
+        if (fmtTokens) parts.push(`${fmtTokens} tokens`);
+        if (fmtCost)   parts.push(fmtCost);
+
+        const footer = document.createElement('div');
+        footer.className = 'steps-footer';
+        footer.innerHTML = parts.map(p => `<span>${esc(p)}</span>`).join('<span class="steps-footer-sep">•</span>');
+        thinkSteps.appendChild(footer);
+      }
+
       const meta = document.createElement('div');
       meta.className = 'answer-meta';
       meta.innerHTML = `<span class="elapsed">⏱ ${elapsed}s</span>`;
@@ -1075,7 +1123,7 @@ const PLACEHOLDER_HTML =
     `<div class="sample-cards">` +
       `<div class="sample-card" data-query="How to resolve a security vulnerability in a Kubernetes cluster?"><div class="card-icon security">🔒</div><div class="card-text">How to resolve a Security Issue</div></div>` +
       `<div class="sample-card" data-query="How to debug a LangGraph agent?"><div class="card-icon debug">🐛</div><div class="card-text">How to Debug LangGraph Agent</div></div>` +
-      `<div class="sample-card" data-query="How to troubleshoot GPU allocation and driver issues in Kubernetes?"><div class="card-icon gpu">🖥️</div><div class="card-text">How to troubleshoot GPU issue</div></div>` +
+      `<div class="sample-card" data-query="How to design a multi-agent production architecture?"><div class="card-icon gpu">🖥️</div><div class="card-text">How to design guardrails for agents</div></div>` +
     `</div>` +
   `</div>`;
 
