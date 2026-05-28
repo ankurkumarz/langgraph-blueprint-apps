@@ -35,6 +35,7 @@ Core events:
   {"type": "tool_call",    "name": "...", "args": {...}, "id": "..."}
   {"type": "tool_result",  "name": "...", "content": "..."}
   {"type": "text",         "content": "..."}
+  {"type": "usage",        "usage": {"fresh_input_tokens": int, "cache_read_tokens": int, "cache_creation_tokens": int, "output_tokens": int, "per_model": {...}}}
   {"type": "done"}
   {"type": "error",        "detail": "..."}
 
@@ -74,6 +75,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
 import app.subagents as _sub
+from app.token_usage import make_callback, usage_event
 from app.subagents import (
     AGENT_CONFIGS,
     GEMINI_MODEL,
@@ -984,6 +986,8 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
     try:
         graph = await _get_or_build_graph()
 
+        cb = make_callback()
+
         _think_delegation_log_var.set(None)
 
         if ORCHESTRATOR_MODE == "think":
@@ -1005,7 +1009,7 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
         async for mode, chunk in graph.astream(
             inputs,
             stream_mode=["updates", "custom"],
-            config={"recursion_limit": MAX_AGENT_STEPS},
+            config={"recursion_limit": MAX_AGENT_STEPS, "callbacks": [cb]},
         ):
             if mode == "custom":
                 if not include_debug_events and isinstance(chunk, dict):
@@ -1067,6 +1071,7 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
                                 payload = {k: v for k, v in payload.items() if k != "debug"}
                             yield sse(payload)
 
+        yield sse(usage_event(cb))
         yield sse({"type": "done"})
 
     except GraphRecursionError:
