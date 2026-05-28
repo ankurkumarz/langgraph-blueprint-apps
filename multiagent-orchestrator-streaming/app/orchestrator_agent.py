@@ -35,7 +35,7 @@ Core events:
   {"type": "tool_call",    "name": "...", "args": {...}, "id": "..."}
   {"type": "tool_result",  "name": "...", "content": "..."}
   {"type": "text",         "content": "..."}
-  {"type": "usage",        "usage": {"fresh_input_tokens": int, "cache_read_tokens": int, "cache_creation_tokens": int, "output_tokens": int, "per_model": {...}}}
+  {"type": "usage",        "usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int, "per_model": {...}}}
   {"type": "done"}
   {"type": "error",        "detail": "..."}
 
