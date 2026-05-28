@@ -806,6 +806,24 @@ header .subtitle {
   color: var(--text-muted);
 }
 .answer-meta .elapsed { display: flex; align-items: center; gap: 4px; }
+.answer-meta .token-usage { display: flex; align-items: center; gap: 4px; opacity: .85; }
+
+/* ── Thinking-steps lightbox footer ── */
+.steps-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: .72rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.steps-footer-sep {
+  opacity: .4;
+  user-select: none;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════════
    Input bar
