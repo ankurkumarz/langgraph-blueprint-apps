@@ -34,6 +34,7 @@ Core events:
   {"type": "llm_start"}
   {"type": "tool_call",    "name": "...", "args": {...}, "id": "..."}
   {"type": "tool_result",  "name": "...", "content": "..."}
+  {"type": "text_chunk",   "content": "...", "agent": "..."}
   {"type": "text",         "content": "..."}
   {"type": "usage",        "usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int, "per_model": {...}}}
   {"type": "done"}
@@ -1008,7 +1009,7 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
 
         async for mode, chunk in graph.astream(
             inputs,
-            stream_mode=["updates", "custom"],
+            stream_mode=["updates", "custom", "messages"],
             config={"recursion_limit": MAX_AGENT_STEPS, "callbacks": [cb]},
         ):
             if mode == "custom":
@@ -1018,6 +1019,16 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
                     if "debug" in chunk:
                         chunk = {k: v for k, v in chunk.items() if k != "debug"}
                 yield sse(chunk)
+
+            elif mode == "messages":
+                token, metadata = chunk
+                content = token.content if hasattr(token, "content") else ""
+                if content:
+                    yield sse({
+                        "type": "text_chunk",
+                        "content": content,
+                        "agent": metadata.get("langgraph_node", ""),
+                    })
 
             elif mode == "updates":
                 for node_name, state_delta in chunk.items():
