@@ -39,6 +39,7 @@ let totalTime    = 0;
 let rowIndex     = 0;
 let activeToolSteps = {};
 let debugEventCount  = 0;
+let _activeStream    = null;   // AbortController for the in-flight stream
 
 // ── Dummy chat history ───────────────────────────────────────────────────────
 const DUMMY_CHAT_HISTORY = [
@@ -73,6 +74,56 @@ function nowStr() {
 
 function scrollDown() {
   chatScroll.scrollTop = chatScroll.scrollHeight;
+}
+
+// ── Streamable-HTTP POST helper ───────────────────────────────────────────────
+// Stateless transport: no session IDs, no auto-reconnect on drop.
+// Safe for multi-pod deployments — no shared stream state required.
+// Returns a Promise that resolves when the stream closes or the signal fires.
+function streamPost(url, body, { onEvent, signal }) {
+  return (async () => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body:    JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      throw err;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ct = res.headers.get('content-type') ?? '';
+    if (!ct.includes('text/event-stream'))
+      throw new Error(`Expected text/event-stream, got: ${ct}`);
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let   buf     = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const raw = line.slice(5).trim();
+          if (!raw) continue;
+          let evt;
+          try { evt = JSON.parse(raw); } catch { continue; }
+          onEvent(evt);
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') throw err;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
 }
 
 function updateStats(elapsed) {
@@ -1026,6 +1077,7 @@ function handleEvent(evt, thinkSteps, answerBody, answerSection, group, startTim
 async function send() {
   const query = queryEl.value.trim();
   if (!query) return;
+  if (_activeStream) { _activeStream.abort(); _activeStream = null; }
   if (placeholder) { placeholder.remove(); placeholder = null; }
 
   const userMsg = document.createElement('div');
@@ -1068,35 +1120,17 @@ async function send() {
   const startTime  = Date.now();
   debugEventCount  = 0;
 
+  const ctrl = new AbortController();
+  _activeStream = ctrl;
+
   try {
-    const res = await fetch('/agent/conversation', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, debug: debugEnabled }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const reader  = res.body.getReader();
-    const decoder = new TextDecoder();
-    let   buffer  = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data:')) continue;
-        const raw = line.slice(5).trim();
-        if (!raw) continue;
-        let evt;
-        try { evt = JSON.parse(raw); } catch { continue; }
-        // Remove the initial "Thinking…" placeholder on first real event
-        if (thinkingPlaceholder.parentNode) {
-          thinkingPlaceholder.remove();
-        }
+    await streamPost('/agent/conversation', { query, debug: debugEnabled }, {
+      signal:  ctrl.signal,
+      onEvent(evt) {
+        if (thinkingPlaceholder.parentNode) thinkingPlaceholder.remove();
         handleEvent(evt, thinkSteps, answerBody, answerSection, group, startTime);
-      }
-    }
+      },
+    });
   } catch (err) {
     answerSection.style.display = 'flex';
     answerBody.classList.remove('streaming');
@@ -1105,6 +1139,7 @@ async function send() {
     addThinkStep(thinkSteps, { iconClass: 'error', icon: '✕', label: 'Error — ' + err.message.slice(0, 60) });
     addActivity({ iconClass: 'err', icon: '✕', title: 'Error', sub: err.message.slice(0, 60) });
   } finally {
+    _activeStream = null;
     sendBtn.disabled = false;
     sendBtn.innerHTML = 'Send ↑';
     setLive(false);
