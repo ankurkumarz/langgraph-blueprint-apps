@@ -10,6 +10,7 @@ dependencies = [
     "langgraph==1.0.4",
     "langgraph-prebuilt==1.0.4",
     "langgraph-checkpoint-sqlite>=3.0.0",
+    "agentevals>=0.0.9",
     "mlflow==3.7.0",
     "fastapi==0.124.2",
     "uvicorn[standard]>=0.30.0",

@@ -1,5 +1,5 @@
 """
-SQLite-backed LangGraph checkpointer and message log.
+SQLite-backed LangGraph checkpointer, message log, and eval result store.
 
 Provides:
   - get_checkpointer()        → SqliteSaver for LangGraph graph compilation
@@ -7,6 +7,9 @@ Provides:
   - update_message_response() → fill in the assistant response once streaming ends
   - get_chat_history()        → recent sessions for /api/chat/history
   - search_chat_history()     → keyword search for /api/chat/search
+  - save_eval_result()        → persist a trajectory or response eval score
+  - get_eval_results()        → all eval results (newest first)
+  - get_eval_results_by_session() → eval results for one session
 """
 
 import sqlite3
@@ -40,6 +43,22 @@ def _init_messages_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_created ON messages (created_at)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS eval_results (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL,
+            eval_type   TEXT NOT NULL,
+            score       REAL,
+            reasoning   TEXT,
+            created_at  TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_session ON eval_results (session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_created ON eval_results (created_at)"
     )
     conn.commit()
 
@@ -141,6 +160,75 @@ def search_chat_history(query: str, limit: int = 20) -> list[dict]:
             "preview": row[1] if row[1] else "",
             "timestamp": row[3],
             "highlight": row[1],
+        }
+        for row in rows
+    ]
+
+
+def save_eval_result(
+    session_id: str,
+    eval_type: str,
+    score: Optional[float],
+    reasoning: Optional[str],
+) -> str:
+    """Persist one evaluation result and return its generated id."""
+    conn = _get_messages_conn()
+    result_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        "INSERT INTO eval_results (id, session_id, eval_type, score, reasoning, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (result_id, session_id, eval_type, score, reasoning, now),
+    )
+    conn.commit()
+    return result_id
+
+
+def get_eval_results(limit: int = 100) -> list[dict]:
+    """Return all eval results ordered by most recent first."""
+    conn = _get_messages_conn()
+    rows = conn.execute(
+        """
+        SELECT id, session_id, eval_type, score, reasoning, created_at
+        FROM   eval_results
+        ORDER  BY created_at DESC
+        LIMIT  ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "session_id": row[1],
+            "eval_type": row[2],
+            "score": row[3],
+            "reasoning": row[4],
+            "created_at": row[5],
+        }
+        for row in rows
+    ]
+
+
+def get_eval_results_by_session(session_id: str) -> list[dict]:
+    """Return eval results for a specific session."""
+    conn = _get_messages_conn()
+    rows = conn.execute(
+        """
+        SELECT id, session_id, eval_type, score, reasoning, created_at
+        FROM   eval_results
+        WHERE  session_id = ?
+        ORDER  BY created_at DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "id": row[0],
+            "session_id": row[1],
+            "eval_type": row[2],
+            "score": row[3],
+            "reasoning": row[4],
+            "created_at": row[5],
         }
         for row in rows
     ]

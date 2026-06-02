@@ -911,6 +911,15 @@ def invalidate_graph_cache() -> None:
     logging.info("Graph cache invalidated — will rebuild on next request")
 
 
+def get_cached_graph():
+    """Return the cached compiled graph, or None if not yet built.
+
+    Used by the eval module to extract graph trajectories from checkpointed
+    threads without triggering a fresh graph build.
+    """
+    return _cached_graph
+
+
 async def wait_for_inflight(timeout: float = 30.0) -> bool:
     """Wait until all in-flight requests have completed.
 

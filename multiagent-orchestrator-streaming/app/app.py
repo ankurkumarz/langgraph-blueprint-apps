@@ -42,6 +42,7 @@ from starlette.responses import Response
 
 from app.agent import (
     begin_shutdown,
+    get_cached_graph,
     get_inflight_count,
     invalidate_graph_cache,
     is_shutting_down,
@@ -52,10 +53,13 @@ from app.agent import (
 )
 from app.checkpoint import (
     get_chat_history,
+    get_eval_results,
+    get_eval_results_by_session,
     save_message,
     search_chat_history,
     update_message_response,
 )
+from app.evals import run_evals_background
 from app.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -253,7 +257,17 @@ async def agent_conversation(request: ChatRequest):
                 except Exception:
                     pass
             elif '"type": "done"' in raw:
-                update_message_response(msg_id, "".join(text_chunks))
+                final_response = "".join(text_chunks)
+                update_message_response(msg_id, final_response)
+                # Fire-and-forget background evals — does not block the stream.
+                asyncio.create_task(
+                    run_evals_background(
+                        session_id=session_id,
+                        query=request.query,
+                        response=final_response,
+                        graph=get_cached_graph(),
+                    )
+                )
 
     return StreamingResponse(
         _tracked_stream(),
@@ -340,7 +354,7 @@ async def readyz():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Chat History (dummy — replace with real service later)
+#  Chat History
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/chat/history")
@@ -355,6 +369,34 @@ async def chat_search(q: Optional[str] = Query(default="")):
     if not q or not q.strip():
         return []
     return search_chat_history(q.strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Agent Eval Results
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/eval/results")
+async def eval_results():
+    """Return all agent eval results (trajectory + relevance), newest first.
+
+    Results are populated asynchronously after each conversation ends;
+    allow a few seconds after receiving the ``done`` SSE event before
+    querying this endpoint.
+    """
+    return get_eval_results()
+
+
+@app.get("/api/eval/results/{session_id}")
+async def eval_results_by_session(session_id: str):
+    """Return trajectory and relevance eval results for one conversation thread."""
+    results = get_eval_results_by_session(session_id)
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No eval results found for session '{session_id}'",
+        )
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
