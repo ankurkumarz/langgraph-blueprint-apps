@@ -76,6 +76,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
 import app.subagents as _sub
+from app.checkpoint import get_checkpointer
 from app.token_usage import make_callback, usage_event
 from app.subagents import (
     AGENT_CONFIGS,
@@ -167,7 +168,7 @@ IMPORTANT:
   a follow-up when there is a clear, significant gap."""
 
 
-def build_evaluator_orchestrator(registry: dict[str, dict]):
+def build_evaluator_orchestrator(registry: dict[str, dict], checkpointer=None):
     """
     Build the evaluator-mode orchestrator graph.
 
@@ -529,7 +530,7 @@ def build_evaluator_orchestrator(registry: dict[str, dict]):
         "evaluate", route_after_evaluate, route_evaluate_targets)
     builder.add_edge("synthesize", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -574,7 +575,7 @@ Rules:
 """
 
 
-def build_think_orchestrator(registry: dict[str, dict]):
+def build_think_orchestrator(registry: dict[str, dict], checkpointer=None):
     """
     Build the think-tool orchestrator: a single ReAct loop.
 
@@ -824,7 +825,7 @@ def build_think_orchestrator(registry: dict[str, dict]):
     builder.add_edge("tools", "tool_result_emitter")
     builder.add_edge("tool_result_emitter", "orchestrator")
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -885,14 +886,15 @@ async def _get_or_build_graph():
 
         tool_buckets = _partition_tools(all_tools)
         registry = _build_agent_registry(tool_buckets)
+        checkpointer = get_checkpointer()
 
         if ORCHESTRATOR_MODE == "think":
-            graph = build_think_orchestrator(registry)
+            graph = build_think_orchestrator(registry, checkpointer=checkpointer)
         else:
-            graph = build_evaluator_orchestrator(registry)
+            graph = build_evaluator_orchestrator(registry, checkpointer=checkpointer)
 
         _cached_graph = graph
-        logging.info("Orchestrator graph ready (mode=%s, tools=%d)",
+        logging.info("Orchestrator graph ready (mode=%s, tools=%d, checkpointer=sqlite)",
                      ORCHESTRATOR_MODE, len(all_tools))
         return _cached_graph
 
@@ -962,11 +964,20 @@ async def warm_up() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def stream_agent(query: str, *, include_debug_events: bool = False):
+async def stream_agent(
+    query: str,
+    *,
+    session_id: str | None = None,
+    include_debug_events: bool = False,
+):
     """Async generator that yields SSE strings from the orchestrator.
 
     Args:
         query: The user's question.
+        session_id: Conversation thread identifier.  When supplied, the
+            SQLite checkpointer persists state across requests that share
+            the same session_id, enabling multi-turn memory.  When omitted
+            each request runs in its own isolated thread.
         include_debug_events: When True *and* DEBUG_MODE is enabled on the
             server, debug-only events (``graph_state_update``,
             ``node_response``) are included in the SSE stream.  When False
@@ -1005,12 +1016,20 @@ async def stream_agent(query: str, *, include_debug_events: bool = False):
                 "followup_query": "",
             }
 
-        logging.info("Orchestrator mode: %s", ORCHESTRATOR_MODE)
+        run_config: dict = {
+            "recursion_limit": MAX_AGENT_STEPS,
+            "callbacks": [cb],
+        }
+        if session_id:
+            run_config["configurable"] = {"thread_id": session_id}
+
+        logging.info("Orchestrator mode: %s, session_id: %s",
+                     ORCHESTRATOR_MODE, session_id or "<stateless>")
 
         async for mode, chunk in graph.astream(
             inputs,
             stream_mode=["updates", "custom", "messages"],
-            config={"recursion_limit": MAX_AGENT_STEPS, "callbacks": [cb]},
+            config=run_config,
         ):
             if mode == "custom":
                 if not include_debug_events and isinstance(chunk, dict):
