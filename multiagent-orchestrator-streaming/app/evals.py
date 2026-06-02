@@ -87,7 +87,7 @@ async def _run_trajectory_eval(session_id: str, graph, judge) -> None:
         outputs=extracted["outputs"],
     )
     score = result.get("score")
-    reasoning = result.get("reasoning")
+    reasoning = result.get("comment")  # EvaluatorResult uses 'comment' for explanation
     save_eval_result(
         session_id=session_id,
         eval_type="trajectory",
@@ -118,7 +118,7 @@ async def _run_relevance_eval(
         outputs=response,
     )
     score = result.get("score")
-    reasoning = result.get("reasoning")
+    reasoning = result.get("comment")  # EvaluatorResult uses 'comment' for explanation
     save_eval_result(
         session_id=session_id,
         eval_type="relevance",
