@@ -1,17 +1,23 @@
 """
-SQLite-backed LangGraph checkpointer, message log, and eval result store.
+SQLite-backed LangGraph checkpointer, message log, eval result store,
+and reference trajectory store.
 
 Provides:
-  - get_checkpointer()        → SqliteSaver for LangGraph graph compilation
-  - save_message()            → persist a user query + session to the message log
-  - update_message_response() → fill in the assistant response once streaming ends
-  - get_chat_history()        → recent sessions for /api/chat/history
-  - search_chat_history()     → keyword search for /api/chat/search
-  - save_eval_result()        → persist a trajectory or response eval score
-  - get_eval_results()        → all eval results (newest first)
-  - get_eval_results_by_session() → eval results for one session
+  - get_checkpointer()             → SqliteSaver for LangGraph graph compilation
+  - save_message()                 → persist a user query + session to the message log
+  - update_message_response()      → fill in the assistant response once streaming ends
+  - get_chat_history()             → recent sessions for /api/chat/history
+  - search_chat_history()          → keyword search for /api/chat/search
+  - save_eval_result()             → persist a trajectory or response eval score
+  - get_eval_results()             → all eval results (newest first)
+  - get_eval_results_by_session()  → eval results for one session
+  - save_reference_trajectory()    → store a named "gold" message sequence for match evals
+  - get_reference_trajectory()     → retrieve a stored reference by name
+  - list_reference_trajectories()  → list all stored references
+  - delete_reference_trajectory()  → remove a stored reference
 """
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime
@@ -60,6 +66,14 @@ def _init_messages_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_eval_created ON eval_results (created_at)"
     )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reference_trajectories (
+            name        TEXT PRIMARY KEY,
+            description TEXT,
+            messages_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        )
+    """)
     conn.commit()
 
 
@@ -232,3 +246,88 @@ def get_eval_results_by_session(session_id: str) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# ── Reference Trajectories ────────────────────────────────────────────────────
+#
+# A reference trajectory is a named, serialised list of LangChain messages
+# from a "gold standard" run.  Match evaluators compare a new run's messages
+# against the stored reference to detect regressions.
+
+
+def save_reference_trajectory(
+    name: str,
+    messages: list,
+    description: str = "",
+) -> None:
+    """Persist a named reference trajectory (serialised messages).
+
+    `messages` must be a list of LangChain BaseMessage objects or dicts
+    already in `messages_to_dict` format.
+    """
+    from langchain_core.messages import BaseMessage, messages_to_dict
+
+    if messages and isinstance(messages[0], BaseMessage):
+        messages = messages_to_dict(messages)
+
+    conn = _get_messages_conn()
+    now = datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """
+        INSERT INTO reference_trajectories (name, description, messages_json, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            description   = excluded.description,
+            messages_json = excluded.messages_json,
+            created_at    = excluded.created_at
+        """,
+        (name, description, json.dumps(messages), now),
+    )
+    conn.commit()
+
+
+def get_reference_trajectory(name: str) -> Optional[dict]:
+    """Return the stored reference trajectory for ``name``, or None if missing.
+
+    The returned ``messages`` list contains deserialised LangChain BaseMessage
+    objects ready for use with trajectory match evaluators.
+    """
+    from langchain_core.messages import messages_from_dict
+
+    conn = _get_messages_conn()
+    row = conn.execute(
+        "SELECT name, description, messages_json, created_at"
+        " FROM reference_trajectories WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "name": row[0],
+        "description": row[1],
+        "messages": messages_from_dict(json.loads(row[2])),
+        "created_at": row[3],
+    }
+
+
+def list_reference_trajectories() -> list[dict]:
+    """Return all stored references (without the raw message payloads)."""
+    conn = _get_messages_conn()
+    rows = conn.execute(
+        "SELECT name, description, created_at"
+        " FROM reference_trajectories ORDER BY created_at DESC"
+    ).fetchall()
+    return [
+        {"name": row[0], "description": row[1], "created_at": row[2]}
+        for row in rows
+    ]
+
+
+def delete_reference_trajectory(name: str) -> bool:
+    """Delete a reference by name.  Returns True if a row was deleted."""
+    conn = _get_messages_conn()
+    cursor = conn.execute(
+        "DELETE FROM reference_trajectories WHERE name = ?", (name,)
+    )
+    conn.commit()
+    return cursor.rowcount > 0

@@ -52,14 +52,18 @@ from app.agent import (
     warm_up,
 )
 from app.checkpoint import (
+    delete_reference_trajectory,
     get_chat_history,
     get_eval_results,
     get_eval_results_by_session,
+    get_reference_trajectory,
+    list_reference_trajectories,
     save_message,
+    save_reference_trajectory,
     search_chat_history,
     update_message_response,
 )
-from app.evals import run_evals_background
+from app.evals import extract_session_messages, run_evals_background
 from app.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -227,6 +231,15 @@ class ChatRequest(BaseModel):
             "Omit (or pass null) to start a fresh, stateless session."
         ),
     )
+    reference_name: Optional[str] = Field(
+        None,
+        description=(
+            "Name of a stored reference trajectory to compare against.  "
+            "When supplied, trajectory match evals (strict / unordered / "
+            "subset / superset) run automatically after the conversation "
+            "and results appear in GET /api/eval/results/{session_id}."
+        ),
+    )
     debug: bool = Field(False, description="Include debug events in the SSE stream")
 
 
@@ -266,6 +279,7 @@ async def agent_conversation(request: ChatRequest):
                         query=request.query,
                         response=final_response,
                         graph=get_cached_graph(),
+                        reference_name=request.reference_name,
                     )
                 )
 
@@ -378,18 +392,17 @@ async def chat_search(q: Optional[str] = Query(default="")):
 
 @app.get("/api/eval/results")
 async def eval_results():
-    """Return all agent eval results (trajectory + relevance), newest first.
+    """Return all agent eval results (all types), newest first.
 
     Results are populated asynchronously after each conversation ends;
-    allow a few seconds after receiving the ``done`` SSE event before
-    querying this endpoint.
+    allow a few seconds after receiving the ``done`` SSE event.
     """
     return get_eval_results()
 
 
 @app.get("/api/eval/results/{session_id}")
 async def eval_results_by_session(session_id: str):
-    """Return trajectory and relevance eval results for one conversation thread."""
+    """Return all eval results (match + graph_trajectory + relevance) for a session."""
     results = get_eval_results_by_session(session_id)
     if not results:
         raise HTTPException(
@@ -397,6 +410,92 @@ async def eval_results_by_session(session_id: str):
             detail=f"No eval results found for session '{session_id}'",
         )
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Reference Trajectory Management
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SaveReferenceRequest(BaseModel):
+    session_id: str = Field(
+        ...,
+        description="ID of the session whose messages should become the reference.",
+    )
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=120,
+        description="Unique name for this reference (e.g. 'k8s_security_v1').",
+    )
+    description: str = Field(
+        "",
+        description="Human-readable note about what this reference represents.",
+    )
+
+
+@app.post("/api/eval/references", status_code=201)
+async def save_reference(body: SaveReferenceRequest):
+    """Promote a completed session's messages as a named reference trajectory.
+
+    Call this after a conversation you consider a "gold standard" run.
+    Subsequent calls to POST /agent/conversation with ``reference_name``
+    set to this name will run trajectory match evals (strict / unordered /
+    subset / superset) and store the scores in /api/eval/results.
+    """
+    graph = get_cached_graph()
+    if graph is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Graph not yet built — send at least one conversation first.",
+        )
+
+    messages = await extract_session_messages(graph, body.session_id)
+    if not messages:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No checkpointed messages found for session '{body.session_id}'.",
+        )
+
+    save_reference_trajectory(body.name, messages, body.description)
+    return {
+        "status": "ok",
+        "name": body.name,
+        "message_count": len(messages),
+    }
+
+
+@app.get("/api/eval/references")
+async def list_references():
+    """Return all stored reference trajectories (name + description, no payloads)."""
+    return list_reference_trajectories()
+
+
+@app.get("/api/eval/references/{name}")
+async def get_reference(name: str):
+    """Return metadata for one stored reference (without the raw message list)."""
+    ref = get_reference_trajectory(name)
+    if ref is None:
+        raise HTTPException(
+            status_code=404, detail=f"Reference '{name}' not found."
+        )
+    return {
+        "name": ref["name"],
+        "description": ref["description"],
+        "message_count": len(ref["messages"]),
+        "created_at": ref["created_at"],
+    }
+
+
+@app.delete("/api/eval/references/{name}", dependencies=[Depends(verify_admin_key)])
+async def delete_reference(name: str):
+    """Delete a stored reference trajectory (requires X-API-Key header)."""
+    deleted = delete_reference_trajectory(name)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"Reference '{name}' not found."
+        )
+    return {"status": "ok", "name": name}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
