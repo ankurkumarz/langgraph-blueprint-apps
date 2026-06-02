@@ -17,12 +17,13 @@ GET  /api/monitoring/predictions     → predictive alerts (next 4 h)
 """
 
 import asyncio
+import json
 import logging
 import random
 import secrets
 import signal
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,7 @@ from starlette.responses import Response
 
 from app.agent import (
     begin_shutdown,
+    get_cached_graph,
     get_inflight_count,
     invalidate_graph_cache,
     is_shutting_down,
@@ -49,6 +51,19 @@ from app.agent import (
     wait_for_inflight,
     warm_up,
 )
+from app.checkpoint import (
+    delete_reference_trajectory,
+    get_chat_history,
+    get_eval_results,
+    get_eval_results_by_session,
+    get_reference_trajectory,
+    list_reference_trajectories,
+    save_message,
+    save_reference_trajectory,
+    search_chat_history,
+    update_message_response,
+)
+from app.evals import extract_session_messages, run_evals_background
 from app.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -208,6 +223,23 @@ app.mount("/agent/copilot", StaticFiles(directory=_STATIC_DIR, html=True), name=
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH)
+    session_id: Optional[str] = Field(
+        None,
+        description=(
+            "Conversation thread ID.  Reuse the same value across turns to "
+            "enable multi-turn memory via the SQLite checkpointer.  "
+            "Omit (or pass null) to start a fresh, stateless session."
+        ),
+    )
+    reference_name: Optional[str] = Field(
+        None,
+        description=(
+            "Name of a stored reference trajectory to compare against.  "
+            "When supplied, trajectory match evals (strict / unordered / "
+            "subset / superset) run automatically after the conversation "
+            "and results appear in GET /api/eval/results/{session_id}."
+        ),
+    )
     debug: bool = Field(False, description="Include debug events in the SSE stream")
 
 
@@ -218,8 +250,41 @@ class ChatRequest(BaseModel):
 
 @app.post("/agent/conversation")
 async def agent_conversation(request: ChatRequest):
+    session_id = request.session_id or str(uuid.uuid4())
+    msg_id = save_message(session_id, request.query)
+
+    async def _tracked_stream():
+        text_chunks: list[str] = []
+        async for raw in stream_agent(
+            request.query,
+            session_id=session_id,
+            include_debug_events=request.debug,
+        ):
+            yield raw
+            # Accumulate text_chunk content to build the final response text.
+            if '"type": "text_chunk"' in raw:
+                try:
+                    data = json.loads(raw.split("data: ", 1)[1])
+                    if data.get("type") == "text_chunk":
+                        text_chunks.append(data.get("content", ""))
+                except Exception:
+                    pass
+            elif '"type": "done"' in raw:
+                final_response = "".join(text_chunks)
+                update_message_response(msg_id, final_response)
+                # Fire-and-forget background evals — does not block the stream.
+                asyncio.create_task(
+                    run_evals_background(
+                        session_id=session_id,
+                        query=request.query,
+                        response=final_response,
+                        graph=get_cached_graph(),
+                        reference_name=request.reference_name,
+                    )
+                )
+
     return StreamingResponse(
-        stream_agent(request.query, include_debug_events=request.debug),
+        _tracked_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -303,75 +368,134 @@ async def readyz():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Chat History (dummy — replace with real service later)
+#  Chat History
 # ══════════════════════════════════════════════════════════════════════════════
-
-_DUMMY_HISTORY = [
-    {
-        "id": "chat-001",
-        "title": "Kubernetes security hardening",
-        "preview": "How to resolve a security vulnerability in a Kubernetes cluster?",
-        "timestamp": (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z",
-        "messageCount": 4,
-    },
-    {
-        "id": "chat-002",
-        "title": "Debugging CrashLoopBackOff",
-        "preview": "My pod keeps crashing with CrashLoopBackOff — how do I debug it?",
-        "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat() + "Z",
-        "messageCount": 6,
-    },
-    {
-        "id": "chat-003",
-        "title": "GPU scheduling issues",
-        "preview": "Pods requesting nvidia.com/gpu are stuck Pending…",
-        "timestamp": (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z",
-        "messageCount": 8,
-    },
-    {
-        "id": "chat-004",
-        "title": "LangGraph streaming setup",
-        "preview": "How do I set up SSE streaming with LangGraph and FastAPI?",
-        "timestamp": (datetime.utcnow() - timedelta(days=2)).isoformat() + "Z",
-        "messageCount": 3,
-    },
-    {
-        "id": "chat-005",
-        "title": "Helm chart best practices",
-        "preview": "What are the best practices for structuring Helm charts?",
-        "timestamp": (datetime.utcnow() - timedelta(days=3)).isoformat() + "Z",
-        "messageCount": 5,
-    },
-    {
-        "id": "chat-006",
-        "title": "Istio service mesh debugging",
-        "preview": "Sidecar injection is failing silently in my namespace.",
-        "timestamp": (datetime.utcnow() - timedelta(days=5)).isoformat() + "Z",
-        "messageCount": 7,
-    },
-]
-
 
 @app.get("/api/chat/history")
 async def chat_history():
-    return _DUMMY_HISTORY
+    """Return recent chat sessions from the SQLite message log."""
+    return get_chat_history()
 
 
 @app.get("/api/chat/search")
 async def chat_search(q: Optional[str] = Query(default="")):
+    """Keyword search over the SQLite message log."""
     if not q or not q.strip():
         return []
-    needle = q.strip().lower()
-    results = []
-    for chat in _DUMMY_HISTORY:
-        title_lower = chat["title"].lower()
-        preview_lower = chat["preview"].lower()
-        if needle in title_lower or needle in preview_lower:
-            results.append({
-                **chat,
-                "highlight": chat["title"] if needle in title_lower else chat["preview"],
-            })
+    return search_chat_history(q.strip())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Agent Eval Results
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/eval/results")
+async def eval_results():
+    """Return all agent eval results (all types), newest first.
+
+    Results are populated asynchronously after each conversation ends;
+    allow a few seconds after receiving the ``done`` SSE event.
+    """
+    return get_eval_results()
+
+
+@app.get("/api/eval/results/{session_id}")
+async def eval_results_by_session(session_id: str):
+    """Return all eval results (match + graph_trajectory + relevance) for a session."""
+    results = get_eval_results_by_session(session_id)
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No eval results found for session '{session_id}'",
+        )
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Reference Trajectory Management
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SaveReferenceRequest(BaseModel):
+    session_id: str = Field(
+        ...,
+        description="ID of the session whose messages should become the reference.",
+    )
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=120,
+        description="Unique name for this reference (e.g. 'k8s_security_v1').",
+    )
+    description: str = Field(
+        "",
+        description="Human-readable note about what this reference represents.",
+    )
+
+
+@app.post("/api/eval/references", status_code=201)
+async def save_reference(body: SaveReferenceRequest):
+    """Promote a completed session's messages as a named reference trajectory.
+
+    Call this after a conversation you consider a "gold standard" run.
+    Subsequent calls to POST /agent/conversation with ``reference_name``
+    set to this name will run trajectory match evals (strict / unordered /
+    subset / superset) and store the scores in /api/eval/results.
+    """
+    graph = get_cached_graph()
+    if graph is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Graph not yet built — send at least one conversation first.",
+        )
+
+    messages = await extract_session_messages(graph, body.session_id)
+    if not messages:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No checkpointed messages found for session '{body.session_id}'.",
+        )
+
+    save_reference_trajectory(body.name, messages, body.description)
+    return {
+        "status": "ok",
+        "name": body.name,
+        "message_count": len(messages),
+    }
+
+
+@app.get("/api/eval/references")
+async def list_references():
+    """Return all stored reference trajectories (name + description, no payloads)."""
+    return list_reference_trajectories()
+
+
+@app.get("/api/eval/references/{name}")
+async def get_reference(name: str):
+    """Return metadata for one stored reference (without the raw message list)."""
+    ref = get_reference_trajectory(name)
+    if ref is None:
+        raise HTTPException(
+            status_code=404, detail=f"Reference '{name}' not found."
+        )
+    return {
+        "name": ref["name"],
+        "description": ref["description"],
+        "message_count": len(ref["messages"]),
+        "created_at": ref["created_at"],
+    }
+
+
+@app.delete("/api/eval/references/{name}", dependencies=[Depends(verify_admin_key)])
+async def delete_reference(name: str):
+    """Delete a stored reference trajectory (requires X-API-Key header)."""
+    deleted = delete_reference_trajectory(name)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"Reference '{name}' not found."
+        )
+    return {"status": "ok", "name": name}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

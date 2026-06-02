@@ -19,6 +19,7 @@ from app.subagents import (
 )
 from app.orchestrator_agent import (
     begin_shutdown,
+    get_cached_graph,
     get_inflight_count,
     invalidate_graph_cache,
     is_shutting_down,
@@ -38,6 +39,7 @@ __all__ = [
     "handle_mcp_tool_errors",
     "set_debug_mode",
     "begin_shutdown",
+    "get_cached_graph",
     "get_inflight_count",
     "invalidate_graph_cache",
     "is_shutting_down",
